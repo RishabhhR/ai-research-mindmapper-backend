@@ -5,11 +5,11 @@ from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from . import groq_client, ingest, storage
+from . import auth, groq_client, ingest, storage
 
 app = FastAPI(title="AI Research Mindmapper API")
 storage.init_db()
@@ -58,8 +58,8 @@ def health():
 
 
 @app.post("/api/research")
-def research(payload: ResearchRequest):
-    session_id = storage.create_session(payload.query, payload.depth, payload.output)
+def research(payload: ResearchRequest, user_id: str = Depends(auth.get_user_id)):
+    session_id = storage.create_session(payload.query, payload.depth, payload.output, user_id=user_id)
     data = groq_client.generate_research(payload.query, payload.depth, payload.output, source=payload.source, web_search=True)
     summary = data.get("summary", "")
     if isinstance(summary, list):
@@ -77,12 +77,12 @@ def research(payload: ResearchRequest):
 
 
 @app.post("/api/sources")
-async def add_source(request: Request):
+async def add_source(request: Request, user_id: str = Depends(auth.get_user_id)):
     content_type = request.headers.get("content-type", "")
     try:
         if "application/json" in content_type:
             payload = SourceUrlRequest.model_validate(await request.json())
-            session_id = payload.session_id or storage.create_session(payload.topic or payload.url)
+            session_id = payload.session_id or storage.create_session(payload.topic or payload.url, user_id=user_id)
             title, chunks, warnings, source_type = ingest.extract_url(payload.url)
             source_id = storage.add_source(session_id, source_type, title, url=payload.url)
             storage.add_chunks(session_id, source_id, source_type, title, chunks, url=payload.url)
@@ -100,7 +100,7 @@ async def add_source(request: Request):
         filename = request.headers.get("x-filename", "upload.txt")
         if "multipart/form-data" in content_type:
             filename, body = ingest.parse_single_file_multipart(content_type, body)
-        session_id = request.headers.get("x-session-id") or storage.create_session(filename)
+        session_id = request.headers.get("x-session-id") or storage.create_session(filename, user_id=user_id)
         title, chunks, warnings, source_type = ingest.extract_file(filename, body)
         source_id = storage.add_source(session_id, source_type, title)
         storage.add_chunks(session_id, source_id, source_type, title, chunks)
@@ -118,8 +118,8 @@ async def add_source(request: Request):
 
 
 @app.post("/api/sessions/{session_id}/generate")
-def generate(session_id: str, payload: GenerateRequest):
-    session = storage.get_session(session_id)
+def generate(session_id: str, payload: GenerateRequest, user_id: str = Depends(auth.get_user_id)):
+    session = storage.get_session(session_id, user_id=user_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
     chunks = storage.get_chunks(session_id)
@@ -142,8 +142,8 @@ def generate(session_id: str, payload: GenerateRequest):
 
 
 @app.post("/api/sessions/{session_id}/ask")
-def ask(session_id: str, payload: AskRequest):
-    if not storage.get_session(session_id):
+def ask(session_id: str, payload: AskRequest, user_id: str = Depends(auth.get_user_id)):
+    if not storage.get_session(session_id, user_id=user_id):
         raise HTTPException(status_code=404, detail="Session not found.")
     chunks = rank_chunks(storage.get_chunks(session_id), payload.question)
     use_web = len(chunks) < 2
@@ -159,13 +159,13 @@ def ask(session_id: str, payload: AskRequest):
 
 
 @app.get("/api/sessions")
-def sessions():
-    return {"sessions": storage.list_sessions()}
+def sessions(user_id: str = Depends(auth.get_user_id)):
+    return {"sessions": storage.list_sessions(user_id=user_id)}
 
 
 @app.get("/api/sessions/{session_id}")
-def session_detail(session_id: str):
-    session = storage.get_session(session_id)
+def session_detail(session_id: str, user_id: str = Depends(auth.get_user_id)):
+    session = storage.get_session(session_id, user_id=user_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
     return {

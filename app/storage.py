@@ -104,6 +104,7 @@ def init_db() -> None:
                 topic TEXT NOT NULL,
                 depth TEXT NOT NULL,
                 output TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT '',
                 summary TEXT,
                 mindmap_json TEXT,
                 insights_json TEXT,
@@ -151,18 +152,23 @@ def init_db() -> None:
             );
             """
         )
+        # Migrate existing tables that pre-date the user_id column
+        try:
+            conn.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass  # column already exists
 
 
-def create_session(topic: str, depth: str = "Detailed", output: str = "Mindmap") -> str:
+def create_session(topic: str, depth: str = "Detailed", output: str = "Mindmap", user_id: str = "") -> str:
     session_id = new_id("ses")
     created = now_ts()
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO sessions (id, topic, depth, output, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions (id, topic, depth, output, user_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_id, topic, depth, output, created, created),
+            (session_id, topic, depth, output, user_id, created, created),
         )
     return session_id
 
@@ -226,21 +232,28 @@ def add_chunks(session_id: str, source_id: str, source_type: str, title: str, ch
             )
 
 
-def get_session(session_id: str):
+def get_session(session_id: str, user_id: str = None):
     with connect() as conn:
-        row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if user_id is not None:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE id = ? AND user_id = ?",
+                (session_id, user_id),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
         return dict(row) if row else None
 
 
-def list_sessions():
+def list_sessions(user_id: str = ""):
     with connect() as conn:
         return [
             dict(row)
             for row in conn.execute(
                 """
                 SELECT id, topic, depth, output, summary, created_at, updated_at
-                FROM sessions ORDER BY updated_at DESC LIMIT 50
-                """
+                FROM sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 50
+                """,
+                (user_id,),
             ).fetchall()
         ]
 
