@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+uploads/
+*.db
+*.sqlite
+*.sqlite3
+.vercel/
+groq_output.txt
+result.json
+test_*.py
+migrate_to_turso.py
