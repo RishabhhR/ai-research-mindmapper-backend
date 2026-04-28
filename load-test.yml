@@ -1,0 +1,72 @@
+config:
+  target: "https://mindmapper-api-mu.vercel.app"
+  phases:
+    # Warm up: 5 new users/s for 20s → 100 total users in-flight
+    - duration: 20
+      arrivalRate: 5
+      name: "Warm up"
+    # Ramp: 10 new users/s for 60s → adds 600 more
+    - duration: 60
+      arrivalRate: 10
+      rampTo: 30
+      name: "Ramp up"
+    # Sustain: 30 new users/s for 60s → ~2000 total requests served
+    - duration: 60
+      arrivalRate: 30
+      name: "Sustained load (~2000 total reqs)"
+  http:
+    timeout: 30
+  defaults:
+    headers:
+      Content-Type: "application/json"
+
+scenarios:
+  # 50% hit the free public health endpoint
+  - name: "Health check"
+    weight: 50
+    flow:
+      - get:
+          url: "/api/health"
+          expect:
+            - statusCode: 200
+
+  # 20% probe the auth wall (fast 401 path)
+  - name: "Sessions auth wall"
+    weight: 20
+    flow:
+      - get:
+          url: "/api/sessions"
+          expect:
+            - statusCode: 401
+
+  # 10% probe session detail auth wall
+  - name: "Session detail auth wall"
+    weight: 10
+    flow:
+      - get:
+          url: "/api/sessions/ses_loadtest"
+          expect:
+            - statusCode: 401
+
+  # 20% blast the research endpoint with a valid token to exhaust LLM rate limits
+  # Set CLERK_TOKEN env var before running:
+  #   CLERK_TOKEN="Bearer eyJ..." npx artillery run load-test.yml
+  - name: "Research LLM burst (fallback trigger)"
+    weight: 20
+    flow:
+      - post:
+          url: "/api/research"
+          headers:
+            Authorization: "{{ $processEnvironment.CLERK_TOKEN }}"
+          json:
+            query: "{{ $randomString() }} AI research automation"
+            depth: "Basic"
+            output: "Mindmap"
+            source: "Academic + web"
+          expect:
+            - statusCode: 200
+          capture:
+            - json: "$.warnings"
+              as: "warnings"
+            - json: "$.fallback_warning"
+              as: "fallback_warning"

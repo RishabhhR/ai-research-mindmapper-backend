@@ -11,6 +11,6 @@ uploads/
 .vercel/
 groq_output.txt
 result.json
-test_*.py
+/test_*.py
 migrate_to_turso.py
 .vercel
