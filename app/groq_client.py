@@ -18,7 +18,7 @@ def call_groq(messages: List[Dict], use_search: bool = False) -> Dict:
     try:
         response = requests.post(
             GROQ_URL,
-            timeout=45,
+            timeout=8,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -65,7 +65,7 @@ def call_gemini(system_prompt: str, user_prompt: str) -> Dict:
     }
     
     try:
-        resp = requests.post(url, json=payload, timeout=45)
+        resp = requests.post(url, json=payload, timeout=8)
         resp.raise_for_status()
         data = resp.json()
         content = data["candidates"][0]["content"]["parts"][0]["text"]
