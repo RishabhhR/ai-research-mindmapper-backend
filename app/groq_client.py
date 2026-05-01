@@ -120,6 +120,7 @@ def call_llm_with_fallback(
     use_search: bool = False,
     llm_timeout: int = 8,
     skip_ddg: bool = False,
+    max_llm_stages: int = 3,
 ) -> Dict:
     # 1. Groq
     result = call_groq(messages, use_search, timeout=llm_timeout)
@@ -133,6 +134,12 @@ def call_llm_with_fallback(
     gemini_result = call_gemini(system_prompt, user_prompt, timeout=llm_timeout)
     if not gemini_result.get("offline"):
         gemini_result["fallback_warning"] = "Groq unavailable. Used Gemini fallback."
+        return gemini_result
+
+    # Callers can cap at 2 stages (Groq + Gemini) to stay within tight serverless
+    # timeouts. Q&A uses max_llm_stages=2: 4s + 4s = 8s max, leaving headroom
+    # for FastAPI/Vercel overhead under the 10s function limit.
+    if max_llm_stages <= 2:
         return gemini_result
 
     # 3. OpenRouter
@@ -498,11 +505,12 @@ Return citations as objects with title, url, snippet, provenance. Output must be
             },
         ],
         use_search=use_web,
-        # Keep Q&A within Vercel's 10s limit:
-        # 4s Groq + 4s Gemini = 8s max before extractive fallback.
-        # DDG is useless for private-document questions, so skip it.
+        # Keep Q&A within Vercel's 10s function limit.
+        # max_llm_stages=2 → only Groq (4s) + Gemini (4s) = 8s max; OpenRouter
+        # and DDG are skipped so we always have ~2s of headroom for overhead.
         llm_timeout=4,
-        skip_ddg=not use_web,
+        skip_ddg=True,
+        max_llm_stages=2,
     )
     fallback = {
         "answer": result.get("content", ""),
