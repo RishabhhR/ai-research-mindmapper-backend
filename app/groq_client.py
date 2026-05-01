@@ -10,7 +10,7 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
-def call_groq(messages: List[Dict], use_search: bool = False) -> Dict:
+def call_groq(messages: List[Dict], use_search: bool = False, timeout: int = 8) -> Dict:
     api_key = os.getenv("GROQ_API_KEY")
     model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
     if not api_key:
@@ -19,7 +19,7 @@ def call_groq(messages: List[Dict], use_search: bool = False) -> Dict:
     try:
         response = requests.post(
             GROQ_URL,
-            timeout=8,
+            timeout=timeout,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -46,11 +46,11 @@ def call_groq(messages: List[Dict], use_search: bool = False) -> Dict:
     }
 
 
-def call_gemini(system_prompt: str, user_prompt: str) -> Dict:
+def call_gemini(system_prompt: str, user_prompt: str, timeout: int = 8) -> Dict:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return {"offline": True, "content": "", "warning": "GEMINI_API_KEY not set."}
-    
+
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     payload = {
         "systemInstruction": {
@@ -64,9 +64,9 @@ def call_gemini(system_prompt: str, user_prompt: str) -> Dict:
             "temperature": 0.2
         }
     }
-    
+
     try:
-        resp = requests.post(url, json=payload, timeout=8)
+        resp = requests.post(url, json=payload, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
         content = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -88,14 +88,14 @@ def call_duckduckgo(query: str, max_results: int = 5) -> List[Dict]:
         return []
 
 
-def call_openrouter(messages: List[Dict]) -> Dict:
+def call_openrouter(messages: List[Dict], timeout: int = 8) -> Dict:
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         return {"offline": True, "content": "", "warning": "OPENROUTER_API_KEY not set."}
     try:
         resp = requests.post(
             OPENROUTER_URL,
-            timeout=8,
+            timeout=timeout,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -115,9 +115,14 @@ def call_openrouter(messages: List[Dict]) -> Dict:
         return {"offline": True, "content": "", "warning": f"OpenRouter request failed (HTTP {status})"}
 
 
-def call_llm_with_fallback(messages: List[Dict], use_search: bool = False) -> Dict:
+def call_llm_with_fallback(
+    messages: List[Dict],
+    use_search: bool = False,
+    llm_timeout: int = 8,
+    skip_ddg: bool = False,
+) -> Dict:
     # 1. Groq
-    result = call_groq(messages, use_search)
+    result = call_groq(messages, use_search, timeout=llm_timeout)
     if not result.get("offline"):
         return result
 
@@ -125,41 +130,45 @@ def call_llm_with_fallback(messages: List[Dict], use_search: bool = False) -> Di
     user_prompt = next((m["content"] for m in messages if m["role"] == "user"), "")
 
     # 2. Gemini
-    gemini_result = call_gemini(system_prompt, user_prompt)
+    gemini_result = call_gemini(system_prompt, user_prompt, timeout=llm_timeout)
     if not gemini_result.get("offline"):
         gemini_result["fallback_warning"] = "Groq unavailable. Used Gemini fallback."
         return gemini_result
 
     # 3. OpenRouter
-    openrouter_result = call_openrouter(messages)
+    openrouter_result = call_openrouter(messages, timeout=llm_timeout)
     if not openrouter_result.get("offline"):
         openrouter_result["fallback_warning"] = "Groq and Gemini unavailable. Used OpenRouter fallback."
         return openrouter_result
 
     # 4. DuckDuckGo RAG — retrieve then re-synthesise with an LLM
-    query = f"{user_prompt}"[:300]
-    ddg_results = call_duckduckgo(query)
-    if ddg_results:
-        search_context = "\n\n".join(
-            f"{r['title']}: {r['body']}" for r in ddg_results
-        )
-        rag_messages = list(messages) + [
-            {"role": "system", "content": "Use the following web results to answer the question."},
-            {"role": "user", "content": search_context},
-        ]
+    # Skipped for document Q&A (private evidence; DDG can't help) and when
+    # caller needs to stay within tight serverless timeouts.
+    if not skip_ddg:
+        query = f"{user_prompt}"[:300]
+        ddg_results = call_duckduckgo(query)
+        if ddg_results:
+            search_context = "\n\n".join(
+                f"{r['title']}: {r['body']}" for r in ddg_results
+            )
+            rag_messages = list(messages) + [
+                {"role": "system", "content": "Use the following web results to answer the question."},
+                {"role": "user", "content": search_context},
+            ]
 
-        rag_gemini = call_gemini(
-            system_prompt,
-            f"{user_prompt}\n\nWeb results:\n{search_context}",
-        )
-        if not rag_gemini.get("offline"):
-            rag_gemini["fallback_warning"] = "All primary LLMs failed. Used DuckDuckGo + Gemini RAG fallback."
-            return rag_gemini
+            rag_gemini = call_gemini(
+                system_prompt,
+                f"{user_prompt}\n\nWeb results:\n{search_context}",
+                timeout=llm_timeout,
+            )
+            if not rag_gemini.get("offline"):
+                rag_gemini["fallback_warning"] = "All primary LLMs failed. Used DuckDuckGo + Gemini RAG fallback."
+                return rag_gemini
 
-        rag_openrouter = call_openrouter(rag_messages)
-        if not rag_openrouter.get("offline"):
-            rag_openrouter["fallback_warning"] = "All primary LLMs failed. Used DuckDuckGo + OpenRouter RAG fallback."
-            return rag_openrouter
+            rag_openrouter = call_openrouter(rag_messages, timeout=llm_timeout)
+            if not rag_openrouter.get("offline"):
+                rag_openrouter["fallback_warning"] = "All primary LLMs failed. Used DuckDuckGo + OpenRouter RAG fallback."
+                return rag_openrouter
 
     # 5. Extractive fallback
     return result
@@ -489,6 +498,11 @@ Return citations as objects with title, url, snippet, provenance. Output must be
             },
         ],
         use_search=use_web,
+        # Keep Q&A within Vercel's 10s limit:
+        # 4s Groq + 4s Gemini = 8s max before extractive fallback.
+        # DDG is useless for private-document questions, so skip it.
+        llm_timeout=4,
+        skip_ddg=not use_web,
     )
     fallback = {
         "answer": result.get("content", ""),
