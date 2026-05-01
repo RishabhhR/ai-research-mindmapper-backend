@@ -107,24 +107,57 @@ def youtube_video_id(url: str) -> str:
     return parse_qs(parsed.query).get("v", [""])[0]
 
 
+def _youtube_oembed_title(url: str) -> str:
+    """Best-effort: fetch the video title via YouTube oEmbed (works from cloud IPs)."""
+    try:
+        resp = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": url, "format": "json"},
+            timeout=6,
+        )
+        if resp.ok:
+            return resp.json().get("title", "")
+    except Exception:
+        pass
+    return ""
+
+
 def extract_youtube(url: str) -> Tuple[str, List[Dict], List[str], str]:
     video_id = youtube_video_id(url)
     if not video_id:
         raise ValueError("Could not find a YouTube video id in the URL.")
+
+    # Always try oEmbed first — works fine from cloud IPs.
+    title = _youtube_oembed_title(url) or f"YouTube video {video_id}"
+
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
     except Exception:
         return (
-            f"YouTube video {video_id}",
+            title,
             [],
-            ["YouTube transcript extraction requires optional package: youtube-transcript-api."],
+            ["YouTube transcript extraction requires the youtube-transcript-api package."],
             "youtube",
         )
 
-    ytt = YouTubeTranscriptApi()
-    transcript = ytt.fetch(video_id)
-    text = " ".join(snippet.text for snippet in transcript)
-    return f"YouTube video {video_id}", chunk_text(text), [], "youtube"
+    try:
+        ytt = YouTubeTranscriptApi()
+        transcript = ytt.fetch(video_id)
+        text = " ".join(snippet.text for snippet in transcript)
+        return title, chunk_text(text), [], "youtube"
+    except Exception as exc:
+        err = str(exc)
+        # YouTube blocks transcript requests from cloud-provider IPs (AWS/GCP/Azure).
+        # Surface a clear, actionable message instead of the raw library traceback.
+        if "blocked" in err.lower() or "ip" in err.lower() or "too many" in err.lower():
+            warning = (
+                "YouTube has blocked transcript access from cloud servers. "
+                "This is a known YouTube restriction on AWS/GCP/Azure IPs. "
+                "Try pasting the video transcript as a text file instead."
+            )
+        else:
+            warning = f"Could not fetch YouTube transcript: {err[:200]}"
+        return title, [], [warning], "youtube"
 
 
 def parse_single_file_multipart(content_type: str, body: bytes) -> Tuple[str, bytes]:
