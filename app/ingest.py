@@ -1,4 +1,7 @@
+import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -11,6 +14,14 @@ from bs4 import BeautifulSoup
 MAX_FILE_BYTES = 8 * 1024 * 1024
 CHUNK_SIZE = 1800
 CHUNK_OVERLAP = 220
+
+# Groq Whisper: max upload is 25 MB. At 32 kbps that's ~100 min of audio.
+WHISPER_MAX_BYTES = 24 * 1024 * 1024  # stay a little under the hard limit
+
+# Total seconds we allow for yt-dlp download + Whisper transcription combined.
+# Keep this well under the serverless timeout (Vercel free = 10 s, Pro = 60 s).
+# Override via env var so you can raise it after upgrading to Vercel Pro.
+YOUTUBE_PIPELINE_TIMEOUT = int(os.getenv("YOUTUBE_PIPELINE_TIMEOUT", "8"))
 
 
 class MultipartUploadError(ValueError):
@@ -122,42 +133,204 @@ def _youtube_oembed_title(url: str) -> str:
     return ""
 
 
-def extract_youtube(url: str) -> Tuple[str, List[Dict], List[str], str]:
-    video_id = youtube_video_id(url)
-    if not video_id:
-        raise ValueError("Could not find a YouTube video id in the URL.")
+# ── Approach 1: youtube-transcript-api ──────────────────────────────────────
 
-    # Always try oEmbed first — works fine from cloud IPs.
-    title = _youtube_oembed_title(url) or f"YouTube video {video_id}"
-
+def _fetch_transcript_api(video_id: str) -> Tuple[List[Dict], List[str]]:
+    """
+    Try the pre-generated transcript route.
+    Fast (no download), but blocked by YouTube from most cloud IPs.
+    Returns (chunks, warnings).
+    """
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
     except Exception:
-        return (
-            title,
-            [],
-            ["YouTube transcript extraction requires the youtube-transcript-api package."],
-            "youtube",
-        )
+        return [], ["youtube-transcript-api package not installed."]
 
     try:
         ytt = YouTubeTranscriptApi()
         transcript = ytt.fetch(video_id)
         text = " ".join(snippet.text for snippet in transcript)
-        return title, chunk_text(text), [], "youtube"
+        return chunk_text(text), []
     except Exception as exc:
-        err = str(exc)
-        # YouTube blocks transcript requests from cloud-provider IPs (AWS/GCP/Azure).
-        # Surface a clear, actionable message instead of the raw library traceback.
-        if "blocked" in err.lower() or "ip" in err.lower() or "too many" in err.lower():
-            warning = (
-                "YouTube has blocked transcript access from cloud servers. "
-                "This is a known YouTube restriction on AWS/GCP/Azure IPs. "
-                "Try pasting the video transcript as a text file instead."
-            )
-        else:
-            warning = f"Could not fetch YouTube transcript: {err[:200]}"
-        return title, [], [warning], "youtube"
+        return [], [str(exc)]
+
+
+# ── Approach 2: yt-dlp audio download + Groq Whisper STT ────────────────────
+
+def _download_audio(url: str, video_id: str) -> str:
+    """
+    Download the lowest-bitrate audio stream to /tmp using yt-dlp.
+    Returns the local file path on success, raises on failure.
+    yt-dlp has better bot-evasion than youtube-transcript-api and can often
+    pull audio-only streams from IPs that are blocked for transcript scraping.
+    """
+    try:
+        import yt_dlp  # noqa: F401 (presence check)
+    except ImportError:
+        raise RuntimeError("yt-dlp is not installed.")
+
+    import yt_dlp
+
+    audio_path = f"/tmp/yt_audio_{video_id}_{int(time.time())}"
+
+    ydl_opts = {
+        # Prefer lowest-bitrate m4a/opus so the file stays small.
+        # These containers don't require ffmpeg post-processing.
+        "format": (
+            "worstaudio[ext=m4a]/worstaudio[ext=webm]"
+            "/bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio"
+        ),
+        "outtmpl": audio_path + ".%(ext)s",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        # Abort if the audio would exceed Whisper's 25 MB cap.
+        "max_filesize": WHISPER_MAX_BYTES,
+        # Socket-level timeout; keeps individual ops from hanging indefinitely.
+        "socket_timeout": 4,
+        # Realistic browser fingerprint reduces bot-detection rate.
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        },
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+    # yt-dlp appends the real extension; find the file.
+    ext = (info or {}).get("ext", "")
+    candidate = f"{audio_path}.{ext}"
+    if os.path.exists(candidate):
+        return candidate
+
+    # Fallback scan in case ext was wrong
+    for f in Path("/tmp").glob(f"yt_audio_{video_id}_*"):
+        if f.suffix in {".m4a", ".webm", ".mp3", ".ogg", ".opus"}:
+            return str(f)
+
+    raise RuntimeError("yt-dlp finished but audio file not found in /tmp.")
+
+
+def _transcribe_with_groq_whisper(audio_path: str) -> str:
+    """
+    POST the audio file to Groq's Whisper-large-v3 endpoint and return the
+    transcript text.  Uses the same GROQ_API_KEY as the LLM pipeline.
+    """
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY not set — cannot use Whisper transcription.")
+
+    file_size = os.path.getsize(audio_path)
+    if file_size > WHISPER_MAX_BYTES:
+        raise RuntimeError(
+            f"Audio file is {file_size // (1024*1024)} MB, "
+            "which exceeds Groq Whisper's 25 MB limit. "
+            "Try a shorter video."
+        )
+
+    with open(audio_path, "rb") as fh:
+        filename = Path(audio_path).name
+        mime = "audio/mp4" if audio_path.endswith(".m4a") else "audio/webm"
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            timeout=30,
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (filename, fh, mime)},
+            data={
+                "model": "whisper-large-v3",
+                "response_format": "text",
+                "language": "en",
+            },
+        )
+
+    resp.raise_for_status()
+    # response_format=text → plain text body, not JSON
+    return resp.text.strip()
+
+
+def _fetch_audio_whisper(url: str, video_id: str) -> Tuple[List[Dict], str]:
+    """
+    Full pipeline: yt-dlp audio download → Groq Whisper transcription.
+    Runs in a thread so the caller can enforce a wall-clock timeout.
+    Returns (chunks, warning_or_empty_string).
+    """
+    audio_path = None
+    try:
+        audio_path = _download_audio(url, video_id)
+        text = _transcribe_with_groq_whisper(audio_path)
+        if not text:
+            return [], "Whisper returned an empty transcript."
+        return chunk_text(text), ""
+    except Exception as exc:
+        return [], str(exc)
+    finally:
+        if audio_path:
+            try:
+                os.unlink(audio_path)
+            except OSError:
+                pass
+
+
+# ── Public entry point ───────────────────────────────────────────────────────
+
+def extract_youtube(url: str) -> Tuple[str, List[Dict], List[str], str]:
+    video_id = youtube_video_id(url)
+    if not video_id:
+        raise ValueError("Could not find a YouTube video id in the URL.")
+
+    # oEmbed title always works from cloud IPs — fetch it first.
+    title = _youtube_oembed_title(url) or f"YouTube video {video_id}"
+
+    # ── Step 1: try the fast pre-generated transcript route ──────────────────
+    chunks, api_warnings = _fetch_transcript_api(video_id)
+    if chunks:
+        return title, chunks, [], "youtube"
+
+    ip_blocked = any(
+        k in " ".join(api_warnings).lower()
+        for k in ("blocked", "ip", "too many", "403", "429")
+    )
+
+    # ── Step 2: yt-dlp + Groq Whisper STT ────────────────────────────────────
+    # Run in a thread with a hard wall-clock timeout so we don't exceed the
+    # serverless function limit.  Raise YOUTUBE_PIPELINE_TIMEOUT (default 8 s)
+    # via env var after upgrading to Vercel Pro (60 s limit).
+    whisper_warning = ""
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_fetch_audio_whisper, url, video_id)
+            chunks, whisper_warning = future.result(timeout=YOUTUBE_PIPELINE_TIMEOUT)
+        if chunks:
+            return title, chunks, [], "youtube"
+    except FuturesTimeoutError:
+        whisper_warning = (
+            "Audio download timed out on this server. "
+            "For long videos, upgrade to Vercel Pro (60 s limit) or paste the "
+            "transcript as a .txt file."
+        )
+    except Exception as exc:
+        whisper_warning = f"Audio pipeline error: {str(exc)[:200]}"
+
+    # ── Step 3: surface a clear, actionable message ───────────────────────────
+    if ip_blocked:
+        final_warning = (
+            "YouTube blocked transcript access from this cloud server (AWS/GCP/Azure IP). "
+            "The audio pipeline also could not complete in time. "
+            "Workarounds: paste the transcript as a .txt file, or upgrade to Vercel Pro "
+            "for a longer timeout."
+        )
+    elif whisper_warning:
+        final_warning = f"Could not transcribe YouTube video: {whisper_warning}"
+    else:
+        final_warning = (
+            f"Could not extract YouTube transcript: {'; '.join(api_warnings)[:300]}"
+        )
+
+    return title, [], [final_warning], "youtube"
 
 
 def parse_single_file_multipart(content_type: str, body: bytes) -> Tuple[str, bytes]:
