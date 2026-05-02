@@ -152,6 +152,87 @@ def _write_cookie_file() -> str | None:
         return None
 
 
+# ── Approach 0: Supadata transcript API ─────────────────────────────────────
+
+def _fetch_via_supadata(url: str) -> Tuple[List[Dict], str]:
+    """
+    Call Supadata's transcript API — they handle YouTube IP restrictions on
+    their end so this works from any cloud host.
+    Returns (chunks, warning_or_empty).
+    Handles both synchronous (200) and async (202) responses.
+    """
+    api_key = os.getenv("SUPADATA_API_KEY", "").strip()
+    if not api_key:
+        return [], "SUPADATA_API_KEY not set."
+
+    headers = {"x-api-key": api_key}
+    params = {"url": url, "text": "true", "lang": "en"}
+
+    try:
+        resp = requests.get(
+            "https://api.supadata.ai/v1/transcript",
+            params=params,
+            headers=headers,
+            timeout=15,
+        )
+    except Exception as exc:
+        return [], f"Supadata request failed: {str(exc)[:150]}"
+
+    if resp.status_code == 202:
+        # Async job — poll until complete (max ~50 s)
+        try:
+            job_id = resp.json().get("jobId")
+        except Exception:
+            return [], "Supadata returned 202 but no jobId."
+        if not job_id:
+            return [], "Supadata returned 202 but no jobId."
+        for _ in range(25):
+            time.sleep(2)
+            try:
+                poll = requests.get(
+                    f"https://api.supadata.ai/v1/transcript/{job_id}",
+                    headers=headers,
+                    timeout=10,
+                )
+                if not poll.ok:
+                    continue
+                data = poll.json()
+                status = data.get("status", "")
+                if status == "completed":
+                    content = data.get("content", "")
+                    if isinstance(content, str) and len(content) > 80:
+                        return chunk_text(content), ""
+                    return [], "Supadata job completed but returned empty content."
+                if status == "failed":
+                    return [], f"Supadata async job failed: {data.get('error', 'unknown')}"
+            except Exception:
+                continue
+        return [], "Supadata async job timed out after 50 s."
+
+    if not resp.ok:
+        try:
+            err = resp.json().get("message") or resp.json().get("error") or str(resp.status_code)
+        except Exception:
+            err = str(resp.status_code)
+        return [], f"Supadata error: {err}"
+
+    try:
+        data = resp.json()
+    except Exception:
+        return [], "Supadata returned non-JSON response."
+
+    content = data.get("content", "")
+    if isinstance(content, str) and len(content) > 80:
+        return chunk_text(content), ""
+    # Timestamped segment array fallback (text=true should prevent this)
+    if isinstance(content, list):
+        text = " ".join(seg.get("text", "") for seg in content if seg.get("text"))
+        if len(text) > 80:
+            return chunk_text(text), ""
+
+    return [], "Supadata returned an empty transcript."
+
+
 # ── Approach 1: youtube-transcript-api ──────────────────────────────────────
 
 def _fetch_transcript_api(video_id: str) -> Tuple[List[Dict], List[str]]:
@@ -397,7 +478,12 @@ def extract_youtube(url: str) -> Tuple[str, List[Dict], List[str], str]:
     # oEmbed title always works from cloud IPs — fetch it first.
     title = _youtube_oembed_title(url) or f"YouTube video {video_id}"
 
-    # ── Step 1: try the fast pre-generated transcript route ──────────────────
+    # ── Step 1: Supadata transcript API (handles IP blocking server-side) ───────
+    chunks, supadata_warning = _fetch_via_supadata(url)
+    if chunks:
+        return title, chunks, [], "youtube"
+
+    # ── Step 2: try the fast pre-generated transcript route ──────────────────
     chunks, api_warnings = _fetch_transcript_api(video_id)
     if chunks:
         return title, chunks, [], "youtube"
@@ -407,17 +493,17 @@ def extract_youtube(url: str) -> Tuple[str, List[Dict], List[str], str]:
         for k in ("blocked", "ip", "too many", "403", "429")
     )
 
-    # ── Step 2: yt-dlp subtitle-only download using YouTube session cookies ───
+    # ── Step 3: yt-dlp subtitle-only download using YouTube session cookies ───
     chunks, cookie_warning = _fetch_subtitles_with_cookies(url, video_id)
     if chunks:
         return title, chunks, [], "youtube"
 
-    # ── Step 3: Vercel Edge Function (Cloudflare IPs — free, fast) ───────────
+    # ── Step 4: Vercel Edge Function (Cloudflare IPs — free, fast) ───────────
     chunks, edge_warning = _fetch_via_edge(video_id)
     if chunks:
         return title, chunks, [], "youtube"
 
-    # ── Step 4: yt-dlp + Groq Whisper STT ────────────────────────────────────
+    # ── Step 5: yt-dlp + Groq Whisper STT ────────────────────────────────────
     # Run in a thread with a hard wall-clock timeout so we don't exceed the
     # serverless function limit.  Raise YOUTUBE_PIPELINE_TIMEOUT (default 8 s)
     # via env var after upgrading to Vercel Pro (60 s limit).
@@ -437,7 +523,7 @@ def extract_youtube(url: str) -> Tuple[str, List[Dict], List[str], str]:
     except Exception as exc:
         whisper_warning = f"Audio pipeline error: {str(exc)[:200]}"
 
-    # ── Step 4: surface a clear, actionable message ───────────────────────────
+    # ── Step 6: surface a clear, actionable message ───────────────────────────
     if ip_blocked:
         final_warning = (
             "YouTube has blocked transcript access from this server's IP. "
