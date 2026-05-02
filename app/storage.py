@@ -99,6 +99,19 @@ def init_db() -> None:
     with connect() as conn:
         conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT '',
+                type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                input_json TEXT,
+                result_json TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 topic TEXT NOT NULL,
@@ -305,3 +318,48 @@ def get_qa(session_id: str):
                 (session_id,),
             ).fetchall()
         ]
+
+
+# ── Background jobs ────────────────────────────────────────────────────────────
+
+def create_job(session_id: str, user_id: str, job_type: str, input_data: dict) -> str:
+    job_id = new_id("job")
+    created = now_ts()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (id, session_id, user_id, type, status, input_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (job_id, session_id, user_id, job_type, json.dumps(input_data), created, created),
+        )
+    return job_id
+
+
+def get_job(job_id: str, user_id: str = None) -> dict | None:
+    with connect() as conn:
+        if user_id:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE id = ? AND user_id = ?", (job_id, user_id)
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        return None
+    job = dict(row)
+    if job.get("input_json"):
+        job["input"] = json.loads(job["input_json"])
+    if job.get("result_json"):
+        job["result"] = json.loads(job["result_json"])
+    return job
+
+
+def update_job(job_id: str, status: str, result: dict = None, error: str = None) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE jobs SET status = ?, result_json = ?, error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, json.dumps(result) if result is not None else None, error, now_ts(), job_id),
+        )

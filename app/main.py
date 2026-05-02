@@ -2,6 +2,7 @@ import json
 import os
 from typing import Optional
 
+import requests as _requests
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -10,6 +11,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from . import auth, groq_client, ingest, storage
+
+# Self-call URL used to trigger background job workers.
+# Set BACKEND_URL in Vercel env to your production URL.
+BACKEND_URL = os.getenv("BACKEND_URL", "https://mindmapper-api-mu.vercel.app").rstrip("/")
+
+# Shared secret that the main function passes when calling its own worker endpoint.
+# Set INTERNAL_SECRET to any random string in Vercel env vars.
+INTERNAL_SECRET = os.getenv("INTERNAL_SECRET", "")
 
 app = FastAPI(title="AI Research Mindmapper API")
 storage.init_db()
@@ -21,7 +30,7 @@ if _frontend_url:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allowed_origins,
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -82,6 +91,27 @@ async def add_source(request: Request, user_id: str = Depends(auth.get_user_id))
     try:
         if "application/json" in content_type:
             payload = SourceUrlRequest.model_validate(await request.json())
+
+            # ── YouTube: async job so we never block on the 10-60 s pipeline ──
+            if ingest.is_youtube_url(payload.url):
+                session_id = payload.session_id or storage.create_session(
+                    payload.topic or payload.url, user_id=user_id
+                )
+                job_id = storage.create_job(
+                    session_id, user_id, "youtube", {"url": payload.url}
+                )
+                _fire_job(job_id)
+                return {
+                    "id": session_id,
+                    "session_id": session_id,
+                    "job_id": job_id,
+                    "source_type": "youtube",
+                    "status": "pending",
+                    "chunks_count": 0,
+                    "warnings": [],
+                }
+
+            # ── All other URLs: synchronous (fast) ───────────────────────────
             session_id = payload.session_id or storage.create_session(payload.topic or payload.url, user_id=user_id)
             title, chunks, warnings, source_type = ingest.extract_url(payload.url)
             source_id = storage.add_source(session_id, source_type, title, url=payload.url)
@@ -115,6 +145,84 @@ async def add_source(request: Request, user_id: str = Depends(auth.get_user_id))
         }
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _fire_job(job_id: str) -> None:
+    """
+    Trigger the worker endpoint without waiting for its response.
+    Uses a very short read timeout (0.1 s) so the main function returns quickly.
+    The worker is a separate Vercel function instance with its own timeout budget.
+    """
+    try:
+        _requests.post(
+            f"{BACKEND_URL}/api/internal/jobs/{job_id}/run",
+            headers={"X-Internal-Secret": INTERNAL_SECRET},
+            timeout=(3, 0.1),   # connect: 3 s  |  read: 0.1 s (intentionally short)
+        )
+    except Exception:
+        pass   # ReadTimeout is expected — worker received the request and is running
+
+
+@app.post("/api/internal/jobs/{job_id}/run")
+async def run_job(job_id: str, request: Request):
+    """
+    Internal worker: called by _fire_job(), not by the frontend.
+    Runs the heavy YouTube pipeline with the full function-timeout budget (60 s on Pro).
+    Protected by X-Internal-Secret header.
+    """
+    secret = request.headers.get("X-Internal-Secret", "")
+    if INTERNAL_SECRET and secret != INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    job = storage.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] not in ("pending",):
+        return {"ok": True, "status": job["status"]}   # idempotent
+
+    storage.update_job(job_id, "processing")
+
+    try:
+        inp = job.get("input", {})
+        if job["type"] == "youtube":
+            url = inp["url"]
+            session_id = job["session_id"]
+            title, chunks, warnings, source_type = ingest.extract_youtube(url)
+            source_id = storage.add_source(session_id, source_type, title, url=url)
+            if chunks:
+                storage.add_chunks(session_id, source_id, source_type, title, chunks, url=url)
+            storage.update_job(job_id, "done", result={
+                "title": title,
+                "source_id": source_id,
+                "session_id": session_id,
+                "source_type": source_type,
+                "chunks_count": len(chunks),
+                "warnings": warnings,
+            })
+        else:
+            storage.update_job(job_id, "failed", error=f"Unknown job type: {job['type']}")
+    except Exception as exc:
+        storage.update_job(job_id, "failed", error=str(exc)[:500])
+
+    return {"ok": True}
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job_status(job_id: str, user_id: str = Depends(auth.get_user_id)):
+    """Fast polling endpoint — returns job status + result when done."""
+    job = storage.get_job(job_id, user_id=user_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    out = {
+        "job_id": job_id,
+        "status": job["status"],
+        "session_id": job["session_id"],
+    }
+    if job["status"] == "done" and job.get("result"):
+        out.update(job["result"])
+    elif job["status"] == "failed":
+        out["error"] = job.get("error") or "Unknown error"
+    return out
 
 
 @app.post("/api/sessions/{session_id}/generate")
