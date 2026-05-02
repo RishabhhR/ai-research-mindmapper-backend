@@ -144,19 +144,44 @@ def _youtube_oembed_title(url: str) -> str:
 
 def _write_cookie_file() -> str | None:
     """
-    Decode YOUTUBE_COOKIES_B64 env var and write to /tmp/yt_cookies.txt.
+    Decode YOUTUBE_COOKIES_B64 env var and write to a temp path.
     Returns the path on success, None if the env var is not set.
     """
     b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
     if not b64:
         return None
     import base64
-    path = "/tmp/yt_cookies.txt"
+    import tempfile
     try:
+        fd, path = tempfile.mkstemp(suffix=".txt", prefix="yt_ck_", dir="/tmp")
+        os.close(fd)
         Path(path).write_bytes(base64.b64decode(b64))
+        # Restrict to owner-read only so other processes can't read it
+        os.chmod(path, 0o600)
         return path
     except Exception:
         return None
+
+
+def _delete_cookie_file(path: str | None) -> None:
+    """Overwrite and delete the temporary cookie file."""
+    if not path:
+        return
+    try:
+        size = os.path.getsize(path)
+        # Overwrite with zeros before unlinking so data doesn't linger on disk
+        with open(path, "wb") as f:
+            f.write(b"\x00" * size)
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _scrub_path(message: str, path: str | None) -> str:
+    """Remove the cookie file path from error strings before returning to callers."""
+    if path and path in message:
+        return message.replace(path, "<internal>")
+    return message
 
 
 # ── Approach 0: Supadata transcript API ─────────────────────────────────────
@@ -280,15 +305,16 @@ def _fetch_subtitles_with_cookies(url: str, video_id: str) -> Tuple[List[Dict], 
     try:
         import yt_dlp
     except ImportError:
+        _delete_cookie_file(cookie_path)
         return [], "yt-dlp not installed."
 
     sub_base = f"/tmp/yt_sub_{video_id}_{int(time.time())}"
 
     ydl_opts = {
         "cookiefile": cookie_path,
-        "skip_download": True,        # subtitle only — no audio download
-        "writesubtitles": True,       # manual captions
-        "writeautomaticsub": True,    # auto-generated captions
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
         "subtitleslangs": ["en", "en-US", "en-GB"],
         "subtitlesformat": "json3",
         "outtmpl": sub_base,
@@ -299,36 +325,39 @@ def _fetch_subtitles_with_cookies(url: str, video_id: str) -> Tuple[List[Dict], 
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-    except Exception as exc:
-        return [], f"yt-dlp subtitle download failed: {str(exc)[:200]}"
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception as exc:
+            return [], f"yt-dlp subtitle download failed: {_scrub_path(str(exc)[:200], cookie_path)}"
 
-    # Find the written subtitle file (yt-dlp appends lang + ext)
-    for suffix in [".en.json3", ".en-US.json3", ".en-GB.json3"]:
-        sub_path = sub_base + suffix
-        if os.path.exists(sub_path):
-            try:
-                import json
-                data = json.loads(Path(sub_path).read_text())
-                events = data.get("events", [])
-                text = " ".join(
-                    s.get("utf8", "")
-                    for e in events if e.get("segs")
-                    for s in e["segs"]
-                ).replace("\n", " ").strip()
-                if not _has_real_content(text):
-                    return [], "Subtitle file had no real spoken content (annotations only)."
-                return chunk_text(text), ""
-            except Exception as exc:
-                return [], f"Could not parse subtitle file: {str(exc)[:150]}"
-            finally:
+        for suffix in [".en.json3", ".en-US.json3", ".en-GB.json3"]:
+            sub_path = sub_base + suffix
+            if os.path.exists(sub_path):
                 try:
-                    os.unlink(sub_path)
-                except OSError:
-                    pass
+                    import json
+                    data = json.loads(Path(sub_path).read_text())
+                    events = data.get("events", [])
+                    text = " ".join(
+                        s.get("utf8", "")
+                        for e in events if e.get("segs")
+                        for s in e["segs"]
+                    ).replace("\n", " ").strip()
+                    if not _has_real_content(text):
+                        return [], "Subtitle file had no real spoken content (annotations only)."
+                    return chunk_text(text), ""
+                except Exception as exc:
+                    return [], f"Could not parse subtitle file: {_scrub_path(str(exc)[:150], cookie_path)}"
+                finally:
+                    try:
+                        os.unlink(sub_path)
+                    except OSError:
+                        pass
 
-    return [], "Subtitle file not found after yt-dlp ran."
+        return [], "Subtitle file not found after yt-dlp ran."
+    finally:
+        # Always wipe and remove the cookie file — even on success
+        _delete_cookie_file(cookie_path)
 
 
 # ── Approach 3: Vercel Edge Function proxy (Cloudflare IPs) ─────────────────
