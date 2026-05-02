@@ -133,6 +133,25 @@ def _youtube_oembed_title(url: str) -> str:
     return ""
 
 
+# ── Cookie helpers ───────────────────────────────────────────────────────────
+
+def _write_cookie_file() -> str | None:
+    """
+    Decode YOUTUBE_COOKIES_B64 env var and write to /tmp/yt_cookies.txt.
+    Returns the path on success, None if the env var is not set.
+    """
+    b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    if not b64:
+        return None
+    import base64
+    path = "/tmp/yt_cookies.txt"
+    try:
+        Path(path).write_bytes(base64.b64decode(b64))
+        return path
+    except Exception:
+        return None
+
+
 # ── Approach 1: youtube-transcript-api ──────────────────────────────────────
 
 def _fetch_transcript_api(video_id: str) -> Tuple[List[Dict], List[str]]:
@@ -155,7 +174,100 @@ def _fetch_transcript_api(video_id: str) -> Tuple[List[Dict], List[str]]:
         return [], [str(exc)]
 
 
-# ── Approach 2: yt-dlp audio download + Groq Whisper STT ────────────────────
+# ── Approach 2: yt-dlp subtitle download with YouTube cookies ────────────────
+
+def _fetch_subtitles_with_cookies(url: str, video_id: str) -> Tuple[List[Dict], str]:
+    """
+    Use yt-dlp to download just the subtitle file (no audio/video) using the
+    user's exported YouTube session cookies. Bypasses the cloud-IP block
+    because the request is authenticated as a real user session.
+    Returns (chunks, warning_or_empty).
+    """
+    cookie_path = _write_cookie_file()
+    if not cookie_path:
+        return [], "YOUTUBE_COOKIES_B64 not set."
+
+    try:
+        import yt_dlp
+    except ImportError:
+        return [], "yt-dlp not installed."
+
+    sub_base = f"/tmp/yt_sub_{video_id}_{int(time.time())}"
+
+    ydl_opts = {
+        "cookiefile": cookie_path,
+        "skip_download": True,        # subtitle only — no audio download
+        "writesubtitles": True,       # manual captions
+        "writeautomaticsub": True,    # auto-generated captions
+        "subtitleslangs": ["en", "en-US", "en-GB"],
+        "subtitlesformat": "json3",
+        "outtmpl": sub_base,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 10,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as exc:
+        return [], f"yt-dlp subtitle download failed: {str(exc)[:200]}"
+
+    # Find the written subtitle file (yt-dlp appends lang + ext)
+    for suffix in [".en.json3", ".en-US.json3", ".en-GB.json3"]:
+        sub_path = sub_base + suffix
+        if os.path.exists(sub_path):
+            try:
+                import json
+                data = json.loads(Path(sub_path).read_text())
+                events = data.get("events", [])
+                text = " ".join(
+                    s.get("utf8", "")
+                    for e in events if e.get("segs")
+                    for s in e["segs"]
+                ).replace("\n", " ").strip()
+                return chunk_text(text), ""
+            except Exception as exc:
+                return [], f"Could not parse subtitle file: {str(exc)[:150]}"
+            finally:
+                try:
+                    os.unlink(sub_path)
+                except OSError:
+                    pass
+
+    return [], "Subtitle file not found after yt-dlp ran."
+
+
+# ── Approach 3: Vercel Edge Function proxy (Cloudflare IPs) ─────────────────
+
+def _fetch_via_edge(video_id: str) -> Tuple[List[Dict], str]:
+    """
+    Call our own /api/yt-transcript edge function which runs on Cloudflare
+    edge nodes — not AWS/GCP datacenter IPs — so YouTube's block doesn't apply.
+
+    EDGE_TRANSCRIPT_URL should be set to:
+        https://research-mindmapper-vite.vercel.app/api/yt-transcript
+    """
+    edge_url = os.getenv("EDGE_TRANSCRIPT_URL", "").strip()
+    if not edge_url:
+        return [], "EDGE_TRANSCRIPT_URL not configured."
+    try:
+        resp = requests.get(
+            edge_url,
+            params={"v": video_id},
+            timeout=12,
+            headers={"User-Agent": "AIResearchMindmapper/1.0"},
+        )
+        data = resp.json()
+        if resp.ok and data.get("success") and data.get("text"):
+            return chunk_text(data["text"]), ""
+        return [], data.get("error", f"Edge function returned HTTP {resp.status_code}")
+    except Exception as exc:
+        return [], f"Edge function unreachable: {str(exc)[:150]}"
+
+
+# ── Approach 3: yt-dlp audio download + Groq Whisper STT ────────────────────
 
 def _download_audio(url: str, video_id: str) -> str:
     """
@@ -295,7 +407,17 @@ def extract_youtube(url: str) -> Tuple[str, List[Dict], List[str], str]:
         for k in ("blocked", "ip", "too many", "403", "429")
     )
 
-    # ── Step 2: yt-dlp + Groq Whisper STT ────────────────────────────────────
+    # ── Step 2: yt-dlp subtitle-only download using YouTube session cookies ───
+    chunks, cookie_warning = _fetch_subtitles_with_cookies(url, video_id)
+    if chunks:
+        return title, chunks, [], "youtube"
+
+    # ── Step 3: Vercel Edge Function (Cloudflare IPs — free, fast) ───────────
+    chunks, edge_warning = _fetch_via_edge(video_id)
+    if chunks:
+        return title, chunks, [], "youtube"
+
+    # ── Step 4: yt-dlp + Groq Whisper STT ────────────────────────────────────
     # Run in a thread with a hard wall-clock timeout so we don't exceed the
     # serverless function limit.  Raise YOUTUBE_PIPELINE_TIMEOUT (default 8 s)
     # via env var after upgrading to Vercel Pro (60 s limit).
@@ -315,13 +437,12 @@ def extract_youtube(url: str) -> Tuple[str, List[Dict], List[str], str]:
     except Exception as exc:
         whisper_warning = f"Audio pipeline error: {str(exc)[:200]}"
 
-    # ── Step 3: surface a clear, actionable message ───────────────────────────
+    # ── Step 4: surface a clear, actionable message ───────────────────────────
     if ip_blocked:
         final_warning = (
-            "YouTube blocked transcript access from this cloud server (AWS/GCP/Azure IP). "
-            "The audio pipeline also could not complete in time. "
-            "Workarounds: paste the transcript as a .txt file, or upgrade to Vercel Pro "
-            "for a longer timeout."
+            "YouTube has blocked transcript access from this server's IP. "
+            "All fallback methods also failed. "
+            "Please paste the video transcript as a .txt file to continue."
         )
     elif whisper_warning:
         final_warning = f"Could not transcribe YouTube video: {whisper_warning}"
