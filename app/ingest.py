@@ -50,6 +50,13 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+def _has_real_content(text: str, min_chars: int = 300) -> bool:
+    """Return True only if text has enough real spoken content (not just annotations)."""
+    cleaned = re.sub(r"\[.*?\]", "", text)  # strip [Music], [Applause], etc.
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return len(cleaned) >= min_chars
+
+
 def extract_url(url: str) -> Tuple[str, List[Dict], List[str], str]:
     if is_youtube_url(url):
         return extract_youtube(url)
@@ -250,6 +257,8 @@ def _fetch_transcript_api(video_id: str) -> Tuple[List[Dict], List[str]]:
         ytt = YouTubeTranscriptApi()
         transcript = ytt.fetch(video_id)
         text = " ".join(snippet.text for snippet in transcript)
+        if not _has_real_content(text):
+            return [], ["Transcript contained no real spoken content (annotations only)."]
         return chunk_text(text), []
     except Exception as exc:
         return [], [str(exc)]
@@ -308,6 +317,8 @@ def _fetch_subtitles_with_cookies(url: str, video_id: str) -> Tuple[List[Dict], 
                     for e in events if e.get("segs")
                     for s in e["segs"]
                 ).replace("\n", " ").strip()
+                if not _has_real_content(text):
+                    return [], "Subtitle file had no real spoken content (annotations only)."
                 return chunk_text(text), ""
             except Exception as exc:
                 return [], f"Could not parse subtitle file: {str(exc)[:150]}"
@@ -455,8 +466,8 @@ def _fetch_audio_whisper(url: str, video_id: str) -> Tuple[List[Dict], str]:
     try:
         audio_path = _download_audio(url, video_id)
         text = _transcribe_with_groq_whisper(audio_path)
-        if not text:
-            return [], "Whisper returned an empty transcript."
+        if not text or not _has_real_content(text):
+            return [], "Whisper returned an empty or annotation-only transcript."
         return chunk_text(text), ""
     except Exception as exc:
         return [], str(exc)
