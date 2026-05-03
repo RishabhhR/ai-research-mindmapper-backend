@@ -539,10 +539,11 @@ def extract_youtube(url: str) -> Tuple[str, List[Dict], List[str], str]:
 
     # ── Step 6: surface a clear, actionable message ───────────────────────────
     if ip_blocked:
+        # Include cookie-stage detail so we can diagnose failures
+        cookie_detail = f" | Cookie stage: {cookie_warning}" if cookie_warning else ""
         final_warning = (
             "YouTube has blocked transcript access from this server's IP. "
-            "All fallback methods also failed. "
-            "Please paste the video transcript as a .txt file to continue."
+            f"All fallback methods also failed.{cookie_detail}"
         )
     elif whisper_warning:
         final_warning = f"Could not transcribe YouTube video: {whisper_warning}"
