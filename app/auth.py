@@ -33,6 +33,12 @@ def get_user_id(authorization: str = Header(default=None)) -> str:
     stress_key = os.getenv("STRESS_TEST_KEY")
     if stress_key and authorization == f"Bearer {stress_key}":
         return "user_stress_test"
+
+    # Local script bypass — permanent API key for the local transcript-fetch agent.
+    # Set SCRIPT_API_KEY in Vercel env; share it only with your local script.
+    script_key = os.getenv("SCRIPT_API_KEY")
+    if script_key and authorization == f"Bearer {script_key}":
+        return "user_local_script"
     
     token = authorization[7:]
     try:
