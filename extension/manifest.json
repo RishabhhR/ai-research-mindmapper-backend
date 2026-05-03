@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "AI Research Mindmapper",
+  "version": "1.0.0",
+  "description": "Send any YouTube video transcript to AI Research Mindmapper with one click.",
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://mindmapper-api-mu.vercel.app/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Send to Mindmapper"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/watch*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

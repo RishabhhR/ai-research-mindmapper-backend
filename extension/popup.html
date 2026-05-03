@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      width: 300px;
+      background: #0f0f13;
+      color: #e8e8f0;
+      padding: 16px;
+    }
+
+    h1 {
+      font-size: 13px;
+      font-weight: 600;
+      color: #a78bfa;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+
+    #video-title {
+      font-size: 13px;
+      font-weight: 500;
+      line-height: 1.4;
+      margin-bottom: 12px;
+      color: #e8e8f0;
+      display: none;
+    }
+
+    #status {
+      font-size: 12px;
+      color: #888;
+      margin-bottom: 12px;
+      min-height: 16px;
+      line-height: 1.4;
+    }
+
+    #status.error { color: #f87171; }
+    #status.success { color: #4ade80; }
+
+    button {
+      width: 100%;
+      padding: 9px 14px;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity .15s;
+    }
+    button:disabled { opacity: .45; cursor: default; }
+
+    #send-btn {
+      background: #7c3aed;
+      color: #fff;
+      margin-bottom: 8px;
+    }
+    #send-btn:not(:disabled):hover { opacity: .85; }
+
+    .divider {
+      border: none;
+      border-top: 1px solid #2a2a3a;
+      margin: 12px 0;
+    }
+
+    label {
+      font-size: 11px;
+      color: #888;
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    input {
+      width: 100%;
+      padding: 7px 10px;
+      background: #1a1a2e;
+      border: 1px solid #2a2a3a;
+      border-radius: 6px;
+      color: #e8e8f0;
+      font-size: 12px;
+      margin-bottom: 8px;
+      outline: none;
+    }
+    input:focus { border-color: #7c3aed; }
+
+    #save-key-btn {
+      background: #1a1a2e;
+      color: #a78bfa;
+      border: 1px solid #2a2a3a;
+      font-size: 12px;
+      padding: 7px;
+    }
+    #save-key-btn:hover { background: #2a2a3a; }
+
+    #result-link {
+      display: none;
+      font-size: 12px;
+      color: #a78bfa;
+      text-align: center;
+      margin-top: 8px;
+    }
+    #result-link a { color: inherit; }
+  </style>
+</head>
+<body>
+  <h1>AI Research Mindmapper</h1>
+  <div id="video-title"></div>
+  <div id="status">Loading…</div>
+  <button id="send-btn" disabled>Send transcript to Mindmapper</button>
+  <div id="result-link"></div>
+
+  <hr class="divider" />
+  <label for="api-key-input">API Key</label>
+  <input id="api-key-input" type="password" placeholder="Paste your MINDMAPPER_API_KEY" />
+  <button id="save-key-btn">Save key</button>
+
+  <script src="popup.js"></script>
+</body>
+</html>
