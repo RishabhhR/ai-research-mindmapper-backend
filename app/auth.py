@@ -39,6 +39,15 @@ def get_user_id(authorization: str = Header(default=None)) -> str:
     script_key = os.getenv("SCRIPT_API_KEY")
     if script_key and authorization == f"Bearer {script_key}":
         return "user_local_script"
+
+    # Chrome extension bypass — public key baked into the extension.
+    # Token format: "ext_<install_uuid>_<EXTENSION_PUBLIC_KEY>"
+    # Each extension install gets its own stable user_id via the UUID.
+    ext_key = os.getenv("EXTENSION_PUBLIC_KEY")
+    if ext_key and token.endswith(f"_{ext_key}"):
+        parts = token.split("_")
+        install_id = parts[1] if len(parts) >= 3 else "unknown"
+        return f"user_ext_{install_id[:32]}"
     
     token = authorization[7:]
     try:
