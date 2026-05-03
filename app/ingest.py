@@ -19,9 +19,8 @@ CHUNK_OVERLAP = 220
 WHISPER_MAX_BYTES = 24 * 1024 * 1024  # stay a little under the hard limit
 
 # Total seconds we allow for yt-dlp download + Whisper transcription combined.
-# Keep this well under the serverless timeout (Vercel free = 10 s, Pro = 60 s).
-# Override via env var so you can raise it after upgrading to Vercel Pro.
-YOUTUBE_PIPELINE_TIMEOUT = int(os.getenv("YOUTUBE_PIPELINE_TIMEOUT", "8"))
+# Worker function runs with 60 s budget (Vercel Pro); leave a few seconds headroom.
+YOUTUBE_PIPELINE_TIMEOUT = int(os.getenv("YOUTUBE_PIPELINE_TIMEOUT", "50"))
 
 
 class MultipartUploadError(ValueError):
@@ -507,20 +506,15 @@ def extract_youtube(url: str) -> Tuple[str, List[Dict], List[str], str]:
         for k in ("blocked", "ip", "too many", "403", "429")
     )
 
-    # ── Step 3: youtube-transcript-api with cookie-authenticated session ────────
-    chunks, cookie_warning = _fetch_transcript_api_with_cookies(video_id)
-    if chunks:
-        return title, chunks, [], "youtube"
-
-    # ── Step 4: Vercel Edge Function (Cloudflare IPs — free, fast) ───────────
+    # ── Step 3: Vercel Edge Function (Cloudflare IPs — free, fast) ───────────
     chunks, edge_warning = _fetch_via_edge(video_id)
     if chunks:
         return title, chunks, [], "youtube"
 
-    # ── Step 5: yt-dlp + Groq Whisper STT ────────────────────────────────────
-    # Run in a thread with a hard wall-clock timeout so we don't exceed the
-    # serverless function limit.  Raise YOUTUBE_PIPELINE_TIMEOUT (default 8 s)
-    # via env var after upgrading to Vercel Pro (60 s limit).
+    # ── Step 4: yt-dlp audio + Groq Whisper STT ──────────────────────────────
+    # YouTube doesn't restrict audio CDN downloads by IP (only the transcript
+    # metadata API), so yt-dlp can pull audio even when all transcript stages fail.
+    # Runs in a thread capped at YOUTUBE_PIPELINE_TIMEOUT (default 50 s on Pro).
     whisper_warning = ""
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -537,13 +531,13 @@ def extract_youtube(url: str) -> Tuple[str, List[Dict], List[str], str]:
     except Exception as exc:
         whisper_warning = f"Audio pipeline error: {str(exc)[:200]}"
 
-    # ── Step 6: surface a clear, actionable message ───────────────────────────
+    # ── Step 5: surface a clear, actionable message ───────────────────────────
     if ip_blocked:
-        # Include cookie-stage detail so we can diagnose failures
-        cookie_detail = f" | Cookie stage: {cookie_warning}" if cookie_warning else ""
         final_warning = (
-            "YouTube has blocked transcript access from this server's IP. "
-            f"All fallback methods also failed.{cookie_detail}"
+            "Could not fetch transcript: YouTube blocks this server's IP for transcript access, "
+            "and the audio fallback also failed. "
+            f"Audio error: {whisper_warning or 'unknown'}. "
+            "Paste the transcript as a .txt file to continue."
         )
     elif whisper_warning:
         final_warning = f"Could not transcribe YouTube video: {whisper_warning}"
