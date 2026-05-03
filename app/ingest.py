@@ -289,74 +289,48 @@ def _fetch_transcript_api(video_id: str) -> Tuple[List[Dict], List[str]]:
         return [], [str(exc)]
 
 
-# ── Approach 2: yt-dlp subtitle download with YouTube cookies ────────────────
+# ── Approach 2: youtube-transcript-api with cookie-authenticated session ──────
 
-def _fetch_subtitles_with_cookies(url: str, video_id: str) -> Tuple[List[Dict], str]:
+def _fetch_transcript_api_with_cookies(video_id: str) -> Tuple[List[Dict], str]:
     """
-    Use yt-dlp to download just the subtitle file (no audio/video) using the
-    user's exported YouTube session cookies. Bypasses the cloud-IP block
-    because the request is authenticated as a real user session.
-    Returns (chunks, warning_or_empty).
+    Same as _fetch_transcript_api but injects the user's YouTube session cookies
+    into a requests.Session passed as http_client. This authenticates the request
+    as a real browser session, bypassing YouTube's cloud-IP block.
+
+    YouTube requires a PO token for yt-dlp subtitle downloads (broken), but
+    the transcript API endpoint still works with cookie-authenticated sessions.
     """
     cookie_path = _write_cookie_file()
     if not cookie_path:
         return [], "YOUTUBE_COOKIES_B64 not set."
 
     try:
-        import yt_dlp
-    except ImportError:
-        _delete_cookie_file(cookie_path)
-        return [], "yt-dlp not installed."
+        import http.cookiejar
+        from requests import Session
+        from youtube_transcript_api import YouTubeTranscriptApi
 
-    sub_base = f"/tmp/yt_sub_{video_id}_{int(time.time())}"
+        session = Session()
+        jar = http.cookiejar.MozillaCookieJar()
+        jar.load(cookie_path, ignore_discard=True, ignore_expires=True)
+        session.cookies = jar
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        })
 
-    ydl_opts = {
-        "cookiefile": cookie_path,
-        "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": ["en", "en-US", "en-GB"],
-        "subtitlesformat": "json3",
-        "outtmpl": sub_base,
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "socket_timeout": 10,
-    }
-
-    try:
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-        except Exception as exc:
-            return [], f"yt-dlp subtitle download failed: {_scrub_path(str(exc)[:200], cookie_path)}"
-
-        for suffix in [".en.json3", ".en-US.json3", ".en-GB.json3"]:
-            sub_path = sub_base + suffix
-            if os.path.exists(sub_path):
-                try:
-                    import json
-                    data = json.loads(Path(sub_path).read_text())
-                    events = data.get("events", [])
-                    text = " ".join(
-                        s.get("utf8", "")
-                        for e in events if e.get("segs")
-                        for s in e["segs"]
-                    ).replace("\n", " ").strip()
-                    if not _has_real_content(text):
-                        return [], "Subtitle file had no real spoken content (annotations only)."
-                    return chunk_text(text), ""
-                except Exception as exc:
-                    return [], f"Could not parse subtitle file: {_scrub_path(str(exc)[:150], cookie_path)}"
-                finally:
-                    try:
-                        os.unlink(sub_path)
-                    except OSError:
-                        pass
-
-        return [], "Subtitle file not found after yt-dlp ran."
+        ytt = YouTubeTranscriptApi(http_client=session)
+        transcript = ytt.fetch(video_id)
+        text = " ".join(snippet.text for snippet in transcript)
+        if not _has_real_content(text):
+            return [], "Cookie-authenticated transcript had no real spoken content."
+        return chunk_text(text), ""
+    except Exception as exc:
+        return [], f"Cookie transcript fetch failed: {_scrub_path(str(exc)[:250], cookie_path)}"
     finally:
-        # Always wipe and remove the cookie file — even on success
         _delete_cookie_file(cookie_path)
 
 
@@ -533,8 +507,8 @@ def extract_youtube(url: str) -> Tuple[str, List[Dict], List[str], str]:
         for k in ("blocked", "ip", "too many", "403", "429")
     )
 
-    # ── Step 3: yt-dlp subtitle-only download using YouTube session cookies ───
-    chunks, cookie_warning = _fetch_subtitles_with_cookies(url, video_id)
+    # ── Step 3: youtube-transcript-api with cookie-authenticated session ────────
+    chunks, cookie_warning = _fetch_transcript_api_with_cookies(video_id)
     if chunks:
         return title, chunks, [], "youtube"
 
