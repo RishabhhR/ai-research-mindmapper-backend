@@ -40,6 +40,8 @@ def get_user_id(authorization: str = Header(default=None)) -> str:
     if script_key and authorization == f"Bearer {script_key}":
         return "user_local_script"
 
+    token = authorization[7:]
+
     # Chrome extension bypass — public key baked into the extension.
     # Token format: "ext_<install_uuid>_<EXTENSION_PUBLIC_KEY>"
     # Each extension install gets its own stable user_id via the UUID.
@@ -48,8 +50,6 @@ def get_user_id(authorization: str = Header(default=None)) -> str:
         parts = token.split("_")
         install_id = parts[1] if len(parts) >= 3 else "unknown"
         return f"user_ext_{install_id[:32]}"
-    
-    token = authorization[7:]
     try:
         signing_key = _jwks_client.get_signing_key_from_jwt(token)
         claims = jwt.decode(
