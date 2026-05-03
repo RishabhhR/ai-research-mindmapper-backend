@@ -63,7 +63,10 @@ class AskRequest(BaseModel):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True}
+    # Set YOUTUBE_STATUS to "degraded" or "down" in Vercel env when
+    # Supadata quota runs out — the frontend will show a banner immediately.
+    yt_status = os.getenv("YOUTUBE_STATUS", "ok")
+    return {"ok": True, "youtube_status": yt_status}
 
 
 @app.post("/api/research")
