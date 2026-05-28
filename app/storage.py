@@ -3,6 +3,7 @@ import os
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import libsql_client  # hard dependency — pip install libsql-client
 
@@ -336,7 +337,7 @@ def create_job(session_id: str, user_id: str, job_type: str, input_data: dict) -
     return job_id
 
 
-def get_job(job_id: str, user_id: str = None) -> dict | None:
+def get_job(job_id: str, user_id: str = None) -> Optional[dict]:
     with connect() as conn:
         if user_id:
             row = conn.execute(
