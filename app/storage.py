@@ -64,11 +64,22 @@ class _TursoConn:
         result = self._client.execute(libsql_client.Statement(sql, list(params)))
         return _TursoCursor(result)
 
+    def batch(self, statements) -> list:
+        """Run many statements in a single HTTP roundtrip.
+
+        statements: iterable of (sql, params) tuples.
+        Returns a list of _TursoCursor, one per statement.
+        """
+        stmts = [libsql_client.Statement(sql, list(params)) for sql, params in statements]
+        if not stmts:
+            return []
+        results = self._client.batch(stmts)
+        return [_TursoCursor(r) for r in results]
+
     def executescript(self, script: str) -> None:
-        """Run each semicolon-separated statement independently."""
+        """Run all semicolon-separated statements in one batched roundtrip."""
         statements = [s.strip() for s in script.split(";") if s.strip()]
-        for stmt in statements:
-            self._client.execute(libsql_client.Statement(stmt))
+        self.batch([(stmt, ()) for stmt in statements])
 
 
 class _TursoCursor:
@@ -164,6 +175,19 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES sessions(id)
             );
+
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                user_id TEXT NOT NULL,
+                bucket TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, bucket)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_chunks_session ON source_chunks(session_id);
+            CREATE INDEX IF NOT EXISTS idx_sources_session ON sources(session_id);
+            CREATE INDEX IF NOT EXISTS idx_qa_session ON qa_history(session_id);
+            CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id)
             """
         )
         # Migrate existing tables that pre-date the user_id column
@@ -222,28 +246,41 @@ def add_source(session_id: str, source_type: str, title: str, url=None, file_pat
 
 
 def add_chunks(session_id: str, source_id: str, source_type: str, title: str, chunks, url=None) -> None:
+    """Insert all chunks in a single batched roundtrip (multi-row INSERTs).
+
+    Long transcripts produce 100+ chunks; per-row HTTP inserts to Turso cost
+    50-100ms each, so batching cuts ingestion from ~10s to a single call.
+    """
+    if not chunks:
+        return
     created = now_ts()
+    ROWS_PER_STMT = 40  # SQLite max vars = 999; 10 cols x 40 rows = 400
+    statements = []
+    for group_start in range(0, len(chunks), ROWS_PER_STMT):
+        group = chunks[group_start:group_start + ROWS_PER_STMT]
+        placeholders = ", ".join(["(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"] * len(group))
+        params = []
+        for offset, chunk in enumerate(group):
+            params.extend([
+                new_id("chk"),
+                source_id,
+                session_id,
+                source_type,
+                title,
+                url,
+                chunk.get("page"),
+                group_start + offset,
+                chunk["text"],
+                created,
+            ])
+        statements.append((
+            "INSERT INTO source_chunks "
+            "(id, source_id, session_id, source_type, title, url, page, chunk_index, text, created_at) "
+            f"VALUES {placeholders}",
+            params,
+        ))
     with connect() as conn:
-        for index, chunk in enumerate(chunks):
-            conn.execute(
-                """
-                INSERT INTO source_chunks
-                (id, source_id, session_id, source_type, title, url, page, chunk_index, text, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    new_id("chk"),
-                    source_id,
-                    session_id,
-                    source_type,
-                    title,
-                    url,
-                    chunk.get("page"),
-                    index,
-                    chunk["text"],
-                    created,
-                ),
-            )
+        conn.batch(statements)
 
 
 def get_session(session_id: str, user_id: str = None):
@@ -319,6 +356,56 @@ def get_qa(session_id: str):
                 (session_id,),
             ).fetchall()
         ]
+
+
+def delete_session(session_id: str, user_id: str) -> bool:
+    """Delete a session and all dependent rows. Returns False if not owned."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM sessions WHERE id = ? AND user_id = ?",
+            (session_id, user_id),
+        ).fetchone()
+        if not row:
+            return False
+        conn.batch([
+            ("DELETE FROM source_chunks WHERE session_id = ?", (session_id,)),
+            ("DELETE FROM sources WHERE session_id = ?", (session_id,)),
+            ("DELETE FROM qa_history WHERE session_id = ?", (session_id,)),
+            ("DELETE FROM jobs WHERE session_id = ?", (session_id,)),
+            ("DELETE FROM sessions WHERE id = ?", (session_id,)),
+        ])
+    return True
+
+
+# ── Rate limiting ──────────────────────────────────────────────────────────────
+
+def bump_rate_counters(user_id: str, minute_bucket: str, day_bucket: str):
+    """Atomically increment the per-minute and per-day counters for a user.
+
+    Returns (minute_count, day_count) after increment. Single HTTP roundtrip.
+    """
+    upsert = (
+        "INSERT INTO rate_limits (user_id, bucket, count) VALUES (?, ?, 1) "
+        "ON CONFLICT(user_id, bucket) DO UPDATE SET count = count + 1 "
+        "RETURNING count"
+    )
+    with connect() as conn:
+        cursors = conn.batch([
+            (upsert, (user_id, minute_bucket)),
+            (upsert, (user_id, day_bucket)),
+        ])
+    minute_row = cursors[0].fetchone() or {}
+    day_row = cursors[1].fetchone() or {}
+    return (
+        int(list(minute_row.values())[0]) if minute_row else 1,
+        int(list(day_row.values())[0]) if day_row else 1,
+    )
+
+
+def cleanup_rate_buckets(older_than_prefix: str) -> None:
+    """Delete counters from previous days (bucket sorts lexicographically)."""
+    with connect() as conn:
+        conn.execute("DELETE FROM rate_limits WHERE bucket < ?", (older_than_prefix,))
 
 
 # ── Background jobs ────────────────────────────────────────────────────────────

@@ -1,5 +1,7 @@
+import ipaddress
 import os
 import re
+import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from html.parser import HTMLParser
@@ -12,6 +14,7 @@ from bs4 import BeautifulSoup
 
 
 MAX_FILE_BYTES = 8 * 1024 * 1024
+MAX_WEBPAGE_BYTES = 3 * 1024 * 1024  # cap webpage downloads at 3 MB
 CHUNK_SIZE = 1800
 CHUNK_OVERLAP = 220
 
@@ -56,17 +59,67 @@ def _has_real_content(text: str, min_chars: int = 300) -> bool:
     return len(cleaned) >= min_chars
 
 
+def assert_public_http_url(url: str) -> None:
+    """SSRF guard: only http(s) URLs that resolve to public addresses.
+
+    Blocks localhost, RFC1918 ranges, link-local (cloud metadata endpoints),
+    and other non-routable targets.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only http(s) URLs are supported.")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("URL has no host.")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise ValueError("Could not resolve the URL's host.") from exc
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError("URL points to a private or internal address.")
+
+
 def extract_url(url: str) -> Tuple[str, List[Dict], List[str], str]:
     if is_youtube_url(url):
         return extract_youtube(url)
 
-    response = requests.get(
+    assert_public_http_url(url)
+
+    with requests.get(
         url,
         timeout=15,
+        stream=True,
         headers={"User-Agent": "AIResearchMindmapper/1.0"},
-    )
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
+    ) as response:
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "").lower()
+        if content_type and not any(
+            t in content_type for t in ("text/", "html", "xml", "json")
+        ):
+            raise ValueError(
+                f"URL returned unsupported content type '{content_type.split(';')[0]}'. "
+                "Paste an article URL, or upload the file directly."
+            )
+        body = b""
+        for chunk in response.iter_content(chunk_size=65536):
+            body += chunk
+            if len(body) > MAX_WEBPAGE_BYTES:
+                break  # parse what we have; enough for any article
+        encoding = response.encoding or "utf-8"
+
+    soup = BeautifulSoup(body.decode(encoding, errors="replace"), "html.parser")
     for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav"]):
         tag.decompose()
     title = normalize_text(soup.title.get_text(" ")) if soup.title else url

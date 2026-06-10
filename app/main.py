@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from typing import Optional
 
@@ -10,7 +11,10 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from . import auth, groq_client, ingest, storage
+from . import auth, groq_client, ingest, ratelimit, storage
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("mindmapper")
 
 # Self-call URL used to trigger background job workers.
 # Set BACKEND_URL in Vercel env to your production URL.
@@ -18,22 +22,42 @@ BACKEND_URL = os.getenv("BACKEND_URL", "https://mindmapper-api-mu.vercel.app").r
 
 # Shared secret that the main function passes when calling its own worker endpoint.
 # Set INTERNAL_SECRET to any random string in Vercel env vars.
+# If unset, jobs run inline in the request (slower, but never unauthenticated).
 INTERNAL_SECRET = os.getenv("INTERNAL_SECRET", "")
 
-app = FastAPI(title="AI Research Mindmapper API")
-storage.init_db()
+APP_VERSION = "1.1.0"
 
-_allowed_origins = ["http://localhost:4173", "http://127.0.0.1:4173", "http://localhost:8008", "null"]
-_frontend_url = os.getenv("FRONTEND_URL")
-if _frontend_url:
-    _allowed_origins.append(_frontend_url)
+app = FastAPI(title="AI Research Mindmapper API")
+
+# Best-effort schema setup. A transient DB blip at cold start must not take
+# the whole API down — tables already exist after the first ever deploy.
+try:
+    storage.init_db()
+except Exception as exc:  # noqa: BLE001
+    logger.warning("init_db failed at cold start (continuing): %s", exc)
+
+# Browsers send credential-less Bearer requests, so CORS is the only thing
+# keeping arbitrary sites from riding a user's quota — keep it to known origins.
+_allowed_origins = [
+    "http://localhost:5173",   # vite dev
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",   # vite preview
+    "http://127.0.0.1:4173",
+    "https://research-mindmapper-vite.vercel.app",
+]
+for env_key in ("FRONTEND_URL", "FRONTEND_URLS"):
+    for origin in (os.getenv(env_key) or "").split(","):
+        origin = origin.strip().rstrip("/")
+        if origin and origin not in _allowed_origins:
+            _allowed_origins.append(origin)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
+    allow_origin_regex=r"https://research-mindmapper-vite-.*\.vercel\.app",  # preview deploys
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Filename", "X-Session-Id"],
 )
 
 
@@ -66,11 +90,12 @@ def health():
     # Set YOUTUBE_STATUS to "degraded" or "down" in Vercel env when
     # Supadata quota runs out — the frontend will show a banner immediately.
     yt_status = os.getenv("YOUTUBE_STATUS", "ok")
-    return {"ok": True, "youtube_status": yt_status}
+    return {"ok": True, "youtube_status": yt_status, "version": APP_VERSION}
 
 
 @app.post("/api/research")
 def research(payload: ResearchRequest, user_id: str = Depends(auth.get_user_id)):
+    ratelimit.enforce(user_id, "llm")
     session_id = storage.create_session(payload.query, payload.depth, payload.output, user_id=user_id)
     data = groq_client.generate_research(payload.query, payload.depth, payload.output, source=payload.source, web_search=True)
     summary = data.get("summary", "")
@@ -90,6 +115,7 @@ def research(payload: ResearchRequest, user_id: str = Depends(auth.get_user_id))
 
 @app.post("/api/sources")
 async def add_source(request: Request, user_id: str = Depends(auth.get_user_id)):
+    ratelimit.enforce(user_id, "ingest")
     content_type = request.headers.get("content-type", "")
     try:
         if "application/json" in content_type:
@@ -155,7 +181,15 @@ def _fire_job(job_id: str) -> None:
     Trigger the worker endpoint without waiting for its response.
     Uses a very short read timeout (0.1 s) so the main function returns quickly.
     The worker is a separate Vercel function instance with its own timeout budget.
+
+    If INTERNAL_SECRET is not configured, the worker endpoint refuses all
+    requests, so we process the job inline instead (slower request, but the
+    pipeline is never exposed unauthenticated).
     """
+    if not INTERNAL_SECRET:
+        logger.warning("INTERNAL_SECRET not set — running job %s inline", job_id)
+        _process_job(job_id)
+        return
     try:
         _requests.post(
             f"{BACKEND_URL}/api/internal/jobs/{job_id}/run",
@@ -166,22 +200,11 @@ def _fire_job(job_id: str) -> None:
         pass   # ReadTimeout is expected — worker received the request and is running
 
 
-@app.post("/api/internal/jobs/{job_id}/run")
-async def run_job(job_id: str, request: Request):
-    """
-    Internal worker: called by _fire_job(), not by the frontend.
-    Runs the heavy YouTube pipeline with the full function-timeout budget (60 s on Pro).
-    Protected by X-Internal-Secret header.
-    """
-    secret = request.headers.get("X-Internal-Secret", "")
-    if INTERNAL_SECRET and secret != INTERNAL_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
+def _process_job(job_id: str) -> None:
+    """Run a pending job to completion. Idempotent."""
     job = storage.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if job["status"] not in ("pending",):
-        return {"ok": True, "status": job["status"]}   # idempotent
+    if not job or job["status"] not in ("pending",):
+        return
 
     storage.update_job(job_id, "processing")
 
@@ -207,7 +230,21 @@ async def run_job(job_id: str, request: Request):
     except Exception as exc:
         storage.update_job(job_id, "failed", error=str(exc)[:500])
 
-    return {"ok": True}
+
+@app.post("/api/internal/jobs/{job_id}/run")
+async def run_job(job_id: str, request: Request):
+    """
+    Internal worker: called by _fire_job(), not by the frontend.
+    Runs the heavy YouTube pipeline with the full function-timeout budget (60 s on Pro).
+    Protected by X-Internal-Secret header; refuses everything when no secret is set.
+    """
+    secret = request.headers.get("X-Internal-Secret", "")
+    if not INTERNAL_SECRET or secret != INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    _process_job(job_id)
+    job = storage.get_job(job_id)
+    return {"ok": True, "status": job["status"] if job else "unknown"}
 
 
 @app.get("/api/jobs/{job_id}")
@@ -230,6 +267,7 @@ def get_job_status(job_id: str, user_id: str = Depends(auth.get_user_id)):
 
 @app.post("/api/sessions/{session_id}/generate")
 def generate(session_id: str, payload: GenerateRequest, user_id: str = Depends(auth.get_user_id)):
+    ratelimit.enforce(user_id, "llm")
     session = storage.get_session(session_id, user_id=user_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
@@ -254,6 +292,7 @@ def generate(session_id: str, payload: GenerateRequest, user_id: str = Depends(a
 
 @app.post("/api/sessions/{session_id}/ask")
 def ask(session_id: str, payload: AskRequest, user_id: str = Depends(auth.get_user_id)):
+    ratelimit.enforce(user_id, "llm")
     if not storage.get_session(session_id, user_id=user_id):
         raise HTTPException(status_code=404, detail="Session not found.")
     chunks = rank_chunks(storage.get_chunks(session_id), payload.question)
@@ -285,6 +324,13 @@ def session_detail(session_id: str, user_id: str = Depends(auth.get_user_id)):
         "chunks": storage.get_chunks(session_id, limit=20),
         "qa_history": [decode_qa(row) for row in storage.get_qa(session_id)],
     }
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str, user_id: str = Depends(auth.get_user_id)):
+    if not storage.delete_session(session_id, user_id=user_id):
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return {"ok": True, "deleted": session_id}
 
 
 def normalize_generation(session_id: str, topic: str, depth: str, output: str, data):

@@ -1,21 +1,32 @@
-# AI Research Mindmapper Backend
+# AI Research Mindmapper — Backend
 
-FastAPI backend for the AI Research Mindmapper frontend.
+FastAPI backend serving the Research Mindmapper frontend (classic + Canvas).
+Deployed on Vercel serverless; data in Turso (hosted SQLite); auth via Clerk JWTs.
 
-## Environment
+## Architecture
 
-Required for real Groq responses:
-
-```bash
-export GROQ_API_KEY="your-groq-api-key"
+```
+app/main.py        API routes, CORS, background-job orchestration
+app/auth.py        Clerk JWT verification (+ extension/script key bypasses)
+app/ratelimit.py   Per-user rate limits (DB-backed, works across instances)
+app/groq_client.py LLM calls: Groq → Gemini → OpenRouter fallback chain
+app/ingest.py      URL / TXT / PDF / YouTube ingestion + chunking + SSRF guard
+app/storage.py     Turso (libsql over HTTP) — batched writes, indexes
+api/index.py       Vercel entry point
+extension/         Chrome extension for browser-side YouTube transcripts
+tests/             pytest suite (no network needed)
+scripts/           load tests + local helpers
 ```
 
-Optional:
+## Setup
 
 ```bash
-export GROQ_MODEL="groq/compound-mini"
-export DATABASE_URL="sqlite:///./mindmapper.db"
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # fill in GROQ_API_KEY, TURSO_URL, TURSO_AUTH_TOKEN
 ```
+
+Turso is **required** (storage refuses to start without it) — free tier is fine.
 
 ## Run
 
@@ -23,15 +34,35 @@ export DATABASE_URL="sqlite:///./mindmapper.db"
 uvicorn app.main:app --host 127.0.0.1 --port 8008 --reload
 ```
 
-The existing frontend expects:
+For local dev without rate limits: `RATE_LIMIT_DISABLED=1`.
 
-```text
-http://127.0.0.1:8008
+## Test
+
+```bash
+python -m pytest tests/ -v
 ```
 
-## Notes
+## API surface
 
-- TXT and webpage URL ingestion work with the installed dependencies.
-- PDF extraction uses `pypdf` when installed; otherwise the API returns a clear dependency warning.
-- YouTube transcript extraction uses `youtube-transcript-api` when installed; otherwise the API returns a clear dependency warning.
-- File upload is implemented without `python-multipart` by manually accepting simple one-file multipart uploads or raw bytes.
+| Method | Path                          | Purpose                              |
+|--------|-------------------------------|--------------------------------------|
+| GET    | /api/health                   | health + youtube status + version    |
+| POST   | /api/research                 | topic → full research map (LLM)      |
+| POST   | /api/sources                  | ingest URL / file (YouTube → async job) |
+| GET    | /api/jobs/{id}                | poll async job status                |
+| POST   | /api/sessions/{id}/generate   | synthesize map from stored evidence  |
+| POST   | /api/sessions/{id}/ask        | Q&A over session evidence            |
+| GET    | /api/sessions                 | list user's sessions                 |
+| GET    | /api/sessions/{id}            | session detail + sources + Q&A       |
+| DELETE | /api/sessions/{id}            | delete session + all dependent rows  |
+
+All routes except `/api/health` require `Authorization: Bearer <Clerk JWT>`.
+LLM routes are rate limited per user (429 + `Retry-After` when exceeded).
+
+## Scale notes
+
+- Chunk inserts are batched (one HTTP roundtrip per source, not per chunk).
+- Rate limiting is DB-backed so it holds across serverless instances.
+- LLM fallback chain is budgeted to finish inside Vercel's 60s limit.
+- Set `INTERNAL_SECRET` in prod so YouTube jobs run on a separate worker
+  invocation; without it they run inline (slower but safe).

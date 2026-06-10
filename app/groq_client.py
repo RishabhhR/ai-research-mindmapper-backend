@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from typing import Dict, List
 
 import requests
@@ -76,18 +77,6 @@ def call_gemini(system_prompt: str, user_prompt: str, timeout: int = 8) -> Dict:
         return {"offline": True, "content": "", "warning": f"Gemini request failed (HTTP {status})"}
 
 
-def call_duckduckgo(query: str, max_results: int = 5) -> List[Dict]:
-    from duckduckgo_search import DDGS
-    try:
-        results = list(DDGS().text(query, max_results=max_results))
-        return [
-            {"title": r.get("title", ""), "body": r.get("body", ""), "url": r.get("href", "")}
-            for r in results
-        ]
-    except Exception:
-        return []
-
-
 def call_openrouter(messages: List[Dict], timeout: int = 8) -> Dict:
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
@@ -119,9 +108,13 @@ def call_llm_with_fallback(
     messages: List[Dict],
     use_search: bool = False,
     llm_timeout: int = 8,
-    skip_ddg: bool = False,
     max_llm_stages: int = 3,
 ) -> Dict:
+    """Groq → Gemini → OpenRouter, each bounded by llm_timeout.
+
+    Worst case wall-clock = max_llm_stages * llm_timeout. Callers must size
+    this to fit their serverless budget (Vercel: 60s research, 10s Q&A).
+    """
     # 1. Groq
     result = call_groq(messages, use_search, timeout=llm_timeout)
     if not result.get("offline"):
@@ -148,36 +141,7 @@ def call_llm_with_fallback(
         openrouter_result["fallback_warning"] = "Groq and Gemini unavailable. Used OpenRouter fallback."
         return openrouter_result
 
-    # 4. DuckDuckGo RAG — retrieve then re-synthesise with an LLM
-    # Skipped for document Q&A (private evidence; DDG can't help) and when
-    # caller needs to stay within tight serverless timeouts.
-    if not skip_ddg:
-        query = f"{user_prompt}"[:300]
-        ddg_results = call_duckduckgo(query)
-        if ddg_results:
-            search_context = "\n\n".join(
-                f"{r['title']}: {r['body']}" for r in ddg_results
-            )
-            rag_messages = list(messages) + [
-                {"role": "system", "content": "Use the following web results to answer the question."},
-                {"role": "user", "content": search_context},
-            ]
-
-            rag_gemini = call_gemini(
-                system_prompt,
-                f"{user_prompt}\n\nWeb results:\n{search_context}",
-                timeout=llm_timeout,
-            )
-            if not rag_gemini.get("offline"):
-                rag_gemini["fallback_warning"] = "All primary LLMs failed. Used DuckDuckGo + Gemini RAG fallback."
-                return rag_gemini
-
-            rag_openrouter = call_openrouter(rag_messages, timeout=llm_timeout)
-            if not rag_openrouter.get("offline"):
-                rag_openrouter["fallback_warning"] = "All primary LLMs failed. Used DuckDuckGo + OpenRouter RAG fallback."
-                return rag_openrouter
-
-    # 5. Extractive fallback
+    # 4. Extractive fallback (callers build a local result from evidence)
     return result
 
 
@@ -334,9 +298,11 @@ def parse_json_or_fallback(content: str, fallback: Dict, required_keys: List[str
             return parsed
     except Exception:
         pass
-        
+
     try:
-        return json.loads(content)
+        parsed = json.loads(content)
+        if has_required_keys(parsed):
+            return parsed
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", content, re.S)
         if match:
@@ -348,7 +314,9 @@ def parse_json_or_fallback(content: str, fallback: Dict, required_keys: List[str
             except Exception:
                 pass
             try:
-                return json.loads(match.group(0))
+                parsed = json.loads(match.group(0))
+                if has_required_keys(parsed):
+                    return parsed
             except json.JSONDecodeError:
                 pass
                 
@@ -417,6 +385,11 @@ def generate_research(
     )
     fallback = offline_generation(topic, evidence_chunks, "web_enriched" if web_search else "source_grounded")
 
+    # Wall-clock budget: stay safely under Vercel's 60s function limit.
+    # Each attempt is bounded at 3 stages x 8s = 24s; retry only if enough
+    # budget remains (covers the "model returned broken JSON" case).
+    deadline = time.monotonic() + int(os.getenv("GENERATE_BUDGET_SECONDS", "45"))
+
     data = None
     result = None
     for attempt in range(2):
@@ -430,6 +403,8 @@ def generate_research(
         data = parse_json_or_fallback(result.get("content", ""), fallback, required_keys=["summary"])
         if data is not fallback:
             break
+        if time.monotonic() > deadline - 25:
+            break  # not enough budget left for another full fallback chain
 
     if result.get("offline") or data is fallback:
         if result.get("offline"):
@@ -506,10 +481,9 @@ Return citations as objects with title, url, snippet, provenance. Output must be
         ],
         use_search=use_web,
         # Keep Q&A within Vercel's 10s function limit.
-        # max_llm_stages=2 → only Groq (4s) + Gemini (4s) = 8s max; OpenRouter
-        # and DDG are skipped so we always have ~2s of headroom for overhead.
+        # max_llm_stages=2 → only Groq (4s) + Gemini (4s) = 8s max, leaving
+        # ~2s of headroom for overhead.
         llm_timeout=4,
-        skip_ddg=True,
         max_llm_stages=2,
     )
     fallback = {
