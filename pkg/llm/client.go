@@ -85,7 +85,7 @@ func (c *Client) callGroq(ctx context.Context, messages []ChatMessage, timeoutSe
 
 	model := c.cfg.GroqModel
 	if model == "" {
-		model = "llama-3.1-8b-instant"
+		model = "qwen/qwen3.8-27b"
 	}
 
 	reqBody := map[string]any{

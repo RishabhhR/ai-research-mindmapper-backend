@@ -91,7 +91,7 @@ func TestLiveGroq(t *testing.T) {
 
 	cfg := &config.Config{
 		GroqAPIKey:            groqKey,
-		GroqModel:             "llama-3.1-8b-instant",
+		GroqModel:             "qwen/qwen3.8-27b",
 		GenerateBudgetSeconds: 30,
 	}
 	client := NewClient(cfg)

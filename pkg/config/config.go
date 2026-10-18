@@ -57,7 +57,7 @@ func Load() *Config {
 		ScriptAPIKey:           getEnv("SCRIPT_API_KEY", ""),
 		ExtensionPublicKey:     getEnv("EXTENSION_PUBLIC_KEY", ""),
 		GroqAPIKey:             getEnv("GROQ_API_KEY", ""),
-		GroqModel:              getEnv("GROQ_MODEL", "llama-3.1-8b-instant"),
+		GroqModel:              getEnv("GROQ_MODEL", "qwen/qwen3.8-27b"),
 		GeminiAPIKey:           getEnv("GEMINI_API_KEY", ""),
 		OpenRouterAPIKey:       getEnv("OPENROUTER_API_KEY", ""),
 		RateLimitLLMPerMin:     getEnvInt("RATE_LIMIT_LLM_PER_MIN", 6),
