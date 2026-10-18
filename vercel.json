@@ -2,15 +2,15 @@
   "version": 2,
   "builds": [
     {
-      "src": "api/index.py",
-      "use": "@vercel/python",
+      "src": "api/index.go",
+      "use": "@vercel/go",
       "config": { "maxDuration": 60 }
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "api/index.py"
+      "dest": "api/index.go"
     }
   ]
 }
