@@ -21,6 +21,7 @@ type Config struct {
 	ScriptAPIKey           string
 	ExtensionPublicKey     string
 	GroqAPIKey             string
+	GroqFallbackAPIKey     string
 	GroqModel              string
 	GeminiAPIKey           string
 	GeminiModel            string
@@ -59,6 +60,7 @@ func Load() *Config {
 		ScriptAPIKey:           getEnv("SCRIPT_API_KEY", ""),
 		ExtensionPublicKey:     getEnv("EXTENSION_PUBLIC_KEY", ""),
 		GroqAPIKey:             getEnv("GROQ_API_KEY", ""),
+		GroqFallbackAPIKey:     getEnv("GROQ_FALLBACK_API_KEY", ""),
 		GroqModel:              getEnv("GROQ_MODEL", "qwen/qwen3.8-27b"),
 		GeminiAPIKey:           getEnv("GEMINI_API_KEY", ""),
 		GeminiModel:            getEnv("GEMINI_MODEL", "gemini-3.5-flash-lite"),

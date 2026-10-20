@@ -3,6 +3,8 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 
@@ -90,6 +92,31 @@ func TestAnswerQuestionWithoutProviderDoesNotClaimUngroundedSuccess(t *testing.T
 	answer := client.AnswerQuestion(context.Background(), "What is the answer?", nil, false)
 	if !answer.Degraded || answer.EvidenceSufficient || len(answer.Citations) != 0 {
 		t.Fatalf("expected unavailable ungrounded answer, got %+v", answer)
+	}
+}
+
+func TestGroqFallbackKeyAfterRateLimit(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		switch r.Header.Get("Authorization") {
+		case "Bearer primary":
+			w.WriteHeader(http.StatusTooManyRequests)
+		case "Bearer fallback":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"ok\":true}"}}]}`))
+		default:
+			t.Errorf("unexpected authorization header")
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&config.Config{GroqAPIKey: "primary", GroqFallbackAPIKey: "fallback"})
+	client.groqURL = server.URL
+	result := client.callGroq(context.Background(), []ChatMessage{{Role: "user", Content: "Return JSON"}}, 2)
+	if result.Offline || result.Content != `{"ok":true}` || requests != 2 {
+		t.Fatalf("expected fallback key after 429, got offline=%v warning=%q content=%q requests=%d", result.Offline, result.Warning, result.Content, requests)
 	}
 }
 

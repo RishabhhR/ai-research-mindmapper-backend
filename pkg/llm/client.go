@@ -17,12 +17,14 @@ import (
 type Client struct {
 	cfg        *config.Config
 	httpClient *http.Client
+	groqURL    string
 }
 
 func NewClient(cfg *config.Config) *Client {
 	return &Client{
 		cfg:        cfg,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
+		groqURL:    "https://api.groq.com/openai/v1/chat/completions",
 	}
 }
 
@@ -79,8 +81,14 @@ type llmCallResult struct {
 }
 
 func (c *Client) callGroq(ctx context.Context, messages []ChatMessage, timeoutSec int) llmCallResult {
-	if c.cfg.GroqAPIKey == "" {
-		return llmCallResult{Offline: true, Content: "", Warning: "GROQ_API_KEY not set"}
+	keys := make([]string, 0, 2)
+	for _, key := range []string{c.cfg.GroqAPIKey, c.cfg.GroqFallbackAPIKey} {
+		if key != "" && (len(keys) == 0 || key != keys[0]) {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return llmCallResult{Offline: true, Warning: "Groq API keys not set"}
 	}
 
 	model := c.cfg.GroqModel
@@ -96,41 +104,47 @@ func (c *Client) callGroq(ctx context.Context, messages []ChatMessage, timeoutSe
 	}
 
 	b, _ := json.Marshal(reqBody)
-	callCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
-	defer cancel()
+	last := llmCallResult{Offline: true, Warning: "Groq unavailable"}
+	for _, key := range keys {
+		callCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+		req, err := http.NewRequestWithContext(callCtx, http.MethodPost, c.groqURL, bytes.NewReader(b))
+		if err != nil {
+			cancel()
+			return llmCallResult{Offline: true, Warning: "Groq request could not be created"}
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Content-Type", "application/json")
 
-	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, "https://api.groq.com/openai/v1/chat/completions", bytes.NewReader(b))
-	if err != nil {
-		return llmCallResult{Offline: true, Warning: err.Error()}
-	}
-	req.Header.Set("Authorization", "Bearer "+c.cfg.GroqAPIKey)
-	req.Header.Set("Content-Type", "application/json")
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			cancel()
+			last = llmCallResult{Offline: true, Warning: fmt.Sprintf("Groq request failed: %v", err)}
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			last = llmCallResult{Offline: true, Warning: fmt.Sprintf("Groq returned HTTP %d", resp.StatusCode)}
+			resp.Body.Close()
+			cancel()
+			continue
+		}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return llmCallResult{Offline: true, Warning: fmt.Sprintf("Groq request failed: %v", err)}
+		var data struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&data)
+		resp.Body.Close()
+		cancel()
+		if err != nil || len(data.Choices) == 0 || data.Choices[0].Message.Content == "" {
+			last = llmCallResult{Offline: true, Warning: "Groq response decode failed"}
+			continue
+		}
+		return llmCallResult{Content: data.Choices[0].Message.Content}
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return llmCallResult{Offline: true, Warning: fmt.Sprintf("Groq returned HTTP %d", resp.StatusCode)}
-	}
-
-	var data struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil || len(data.Choices) == 0 {
-		return llmCallResult{Offline: true, Warning: "Groq response decode failed"}
-	}
-
-	return llmCallResult{
-		Offline: false,
-		Content: data.Choices[0].Message.Content,
-	}
+	return last
 }
 
 func (c *Client) callGemini(ctx context.Context, systemPrompt, userPrompt string, timeoutSec int) llmCallResult {
@@ -268,7 +282,11 @@ func (c *Client) CallLLMWithFallback(ctx context.Context, messages []ChatMessage
 	}
 
 	// 2. Gemini
-	geminiRes := c.callGemini(ctx, sysPrompt, userPrompt, llmTimeout)
+	geminiTimeout := llmTimeout
+	if geminiTimeout < 20 {
+		geminiTimeout = 20
+	}
+	geminiRes := c.callGemini(ctx, sysPrompt, userPrompt, geminiTimeout)
 	if !geminiRes.Offline {
 		geminiRes.FallbackWarning = "Groq unavailable. Used Gemini fallback."
 		return geminiRes
@@ -279,7 +297,11 @@ func (c *Client) CallLLMWithFallback(ctx context.Context, messages []ChatMessage
 	}
 
 	// 3. OpenRouter
-	openRouterRes := c.callOpenRouter(ctx, messages, llmTimeout)
+	openRouterTimeout := llmTimeout
+	if openRouterTimeout < 20 {
+		openRouterTimeout = 20
+	}
+	openRouterRes := c.callOpenRouter(ctx, messages, openRouterTimeout)
 	if !openRouterRes.Offline {
 		openRouterRes.FallbackWarning = "Groq and Gemini unavailable. Used OpenRouter fallback."
 		return openRouterRes
@@ -427,12 +449,18 @@ func (c *Client) GenerateResearch(ctx context.Context, topic, depth, output, sou
 		return data
 	}
 
-	deadline := time.Now().Add(time.Duration(c.cfg.GenerateBudgetSeconds) * time.Second)
+	budgetSeconds := c.cfg.GenerateBudgetSeconds
+	if budgetSeconds <= 0 {
+		budgetSeconds = 45
+	}
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(budgetSeconds)*time.Second)
+	defer cancel()
+	deadline := time.Now().Add(time.Duration(budgetSeconds) * time.Second)
 	messages := buildMindmapPrompt(topic, depth, output, source, evidenceText, webSearch)
 
 	var lastRes llmCallResult
 	for attempt := 0; attempt < 2; attempt++ {
-		lastRes = c.CallLLMWithFallback(ctx, messages, 10, 3)
+		lastRes = c.CallLLMWithFallback(callCtx, messages, 10, 3)
 		if lastRes.Offline {
 			break
 		}
@@ -535,7 +563,7 @@ func (c *Client) AnswerQuestion(ctx context.Context, question string, chunks []d
 		return data
 	}
 
-	if c.cfg.GroqAPIKey == "" && c.cfg.GeminiAPIKey == "" && c.cfg.OpenRouterAPIKey == "" {
+	if c.cfg.GroqAPIKey == "" && c.cfg.GroqFallbackAPIKey == "" && c.cfg.GeminiAPIKey == "" && c.cfg.OpenRouterAPIKey == "" {
 		answer := "The research model is unavailable. Please try again later."
 		prov := "ai_synthesized"
 		if len(chunks) > 0 {
