@@ -131,6 +131,10 @@ func NewClient(rawURL, authToken string) (*Client, error) {
 		authToken: authToken,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
+			// Turso occasionally closes an idle connection behind serverless
+			// functions. A reused POST can then fail with EOF and cannot be
+			// retried safely after a write, so open a fresh connection instead.
+			Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DisableKeepAlives: true, ForceAttemptHTTP2: true},
 		},
 	}, nil
 }
