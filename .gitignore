@@ -14,5 +14,13 @@ result.json
 /test_*.py
 migrate_to_turso.py
 .vercel
+
+# Go
+bin/
+*.exe
+*.test
+*.prof
+
+# OS
 .DS_Store
 scratch/
