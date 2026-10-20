@@ -3,7 +3,6 @@ package ratelimit
 import (
 	"context"
 	"fmt"
-	"log"
 	"math/rand"
 	"time"
 
@@ -50,11 +49,7 @@ func (l *Limiter) Enforce(ctx context.Context, userID, kind string) error {
 	perMin, perDay := l.limits(kind)
 
 	minuteCount, dayCount, err := l.storage.BumpRateCounters(ctx, userID, minuteBucket, dayBucket)
-	if err != nil {
-		// Fail open: log warning and allow request
-		log.Printf("rate limiter unavailable, allowing request: %v", err)
-		return nil
-	}
+	if err != nil { return fmt.Errorf("rate-limit storage unavailable: %w", err) }
 
 	// Opportunistic cleanup of stale buckets (~1% of requests)
 	if rand.Float64() < 0.01 {

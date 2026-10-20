@@ -120,3 +120,12 @@ func TestYouTubeVideoID(t *testing.T) {
 		t.Fatalf("expected dQw4w9WgXcQ, got %s", id)
 	}
 }
+
+func TestYouTubeURLHostAndShorts(t *testing.T) {
+	if IsYouTubeURL("https://youtube.com.evil.example/watch?v=dQw4w9WgXcQ") {
+		t.Fatal("lookalike host must not be accepted as YouTube")
+	}
+	if id := YouTubeVideoID("https://www.youtube.com/shorts/dQw4w9WgXcQ"); id != "dQw4w9WgXcQ" {
+		t.Fatalf("expected Shorts video ID, got %q", id)
+	}
+}

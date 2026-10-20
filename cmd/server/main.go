@@ -30,7 +30,7 @@ func main() {
 	storage := db.NewStorage(tursoClient)
 
 	// 2. Best-effort DB schema initialization (matches Python cold start)
-	initCtx, initCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	initCtx, initCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	if err := storage.InitDB(initCtx); err != nil {
 		log.Printf("Warning: storage.InitDB failed at startup (continuing): %v", err)
 	}

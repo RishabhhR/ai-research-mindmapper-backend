@@ -3,6 +3,7 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,14 +23,18 @@ import (
 )
 
 const WhisperMaxBytes = 24 * 1024 * 1024 // 24 MB
+var videoIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{11}$`)
 
 func IsYouTubeURL(rawURL string) bool {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return false
 	}
-	host := strings.ToLower(parsed.Host)
-	return strings.Contains(host, "youtube.com") || strings.Contains(host, "youtu.be")
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "youtube.com" || strings.HasSuffix(host, ".youtube.com") || host == "youtu.be" || host == "www.youtu.be"
 }
 
 func YouTubeVideoID(rawURL string) string {
@@ -36,17 +42,35 @@ func YouTubeVideoID(rawURL string) string {
 	if err != nil {
 		return ""
 	}
-	host := strings.ToLower(parsed.Host)
-	if strings.Contains(host, "youtu.be") {
-		return strings.Trim(parsed.Path, "/")
+	if !IsYouTubeURL(rawURL) {
+		return ""
 	}
-	return parsed.Query().Get("v")
+	host := strings.ToLower(parsed.Hostname())
+	var id string
+	if host == "youtu.be" || host == "www.youtu.be" {
+		id = strings.Split(strings.Trim(parsed.Path, "/"), "/")[0]
+	} else if strings.HasPrefix(parsed.Path, "/shorts/") || strings.HasPrefix(parsed.Path, "/live/") || strings.HasPrefix(parsed.Path, "/embed/") {
+		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+		if len(parts) > 1 {
+			id = parts[1]
+		}
+	} else {
+		id = parsed.Query().Get("v")
+	}
+	if !videoIDPattern.MatchString(id) {
+		return ""
+	}
+	return id
 }
 
-func YouTubeOEmbedTitle(rawURL string) string {
+func YouTubeOEmbedTitle(ctx context.Context, rawURL string) string {
 	client := &http.Client{Timeout: 6 * time.Second}
 	reqURL := fmt.Sprintf("https://www.youtube.com/oembed?url=%s&format=json", url.QueryEscape(rawURL))
-	resp, err := client.Get(reqURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		return ""
 	}
@@ -61,14 +85,14 @@ func YouTubeOEmbedTitle(rawURL string) string {
 	return ""
 }
 
-func FetchViaSupadata(rawURL, apiKey string) ([]db.ChunkItem, string) {
+func FetchViaSupadata(ctx context.Context, rawURL, apiKey string) ([]db.ChunkItem, string) {
 	if apiKey == "" {
 		return nil, "SUPADATA_API_KEY not set."
 	}
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	reqURL := fmt.Sprintf("https://api.supadata.ai/v1/transcript?url=%s&text=true&lang=en", url.QueryEscape(rawURL))
-	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Sprintf("Supadata request creation failed: %v", err)
 	}
@@ -91,9 +115,16 @@ func FetchViaSupadata(rawURL, apiKey string) ([]db.ChunkItem, string) {
 
 		pollClient := &http.Client{Timeout: 10 * time.Second}
 		for i := 0; i < 25; i++ {
-			time.Sleep(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				return nil, "Transcript processing timed out. Please try again."
+			case <-time.After(2 * time.Second):
+			}
 			pollURL := fmt.Sprintf("https://api.supadata.ai/v1/transcript/%s", jobResp.JobID)
-			pReq, _ := http.NewRequest(http.MethodGet, pollURL, nil)
+			pReq, err := http.NewRequestWithContext(ctx, http.MethodGet, pollURL, nil)
+			if err != nil {
+				return nil, "Could not poll transcript processing."
+			}
 			pReq.Header.Set("x-api-key", apiKey)
 
 			pResp, err := pollClient.Do(pReq)
@@ -151,14 +182,14 @@ func FetchViaSupadata(rawURL, apiKey string) ([]db.ChunkItem, string) {
 	return nil, "Supadata returned an empty transcript."
 }
 
-func FetchViaEdge(videoID, edgeURL string) ([]db.ChunkItem, string) {
+func FetchViaEdge(ctx context.Context, videoID, edgeURL string) ([]db.ChunkItem, string) {
 	if edgeURL == "" {
 		return nil, "EDGE_TRANSCRIPT_URL not configured."
 	}
 
 	client := &http.Client{Timeout: 12 * time.Second}
 	reqURL := fmt.Sprintf("%s?v=%s", edgeURL, url.QueryEscape(videoID))
-	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Sprintf("Edge request build failed: %v", err)
 	}
@@ -186,14 +217,15 @@ func FetchViaEdge(videoID, edgeURL string) ([]db.ChunkItem, string) {
 	return nil, fmt.Sprintf("Edge function returned HTTP %d", resp.StatusCode)
 }
 
-func DownloadAudioYtDlp(ctx context.Context, rawURL, videoID string) (string, error) {
+func DownloadAudioYtDlp(ctx context.Context, rawURL, videoID, cookiesB64 string) (string, error) {
 	ytDlpPath, err := exec.LookPath("yt-dlp")
 	if err != nil {
 		return "", errors.New("yt-dlp is not installed")
 	}
 
-	audioPattern := fmt.Sprintf("/tmp/yt_audio_%s_%d.%%(ext)s", videoID, time.Now().Unix())
-	cmd := exec.CommandContext(ctx, ytDlpPath,
+	prefix := fmt.Sprintf("/tmp/yt_audio_%s_%d", videoID, time.Now().UnixNano())
+	audioPattern := prefix + ".%(ext)s"
+	args := []string{
 		"-f", "worstaudio[ext=m4a]/worstaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
 		"-o", audioPattern,
 		"--quiet",
@@ -202,14 +234,38 @@ func DownloadAudioYtDlp(ctx context.Context, rawURL, videoID string) (string, er
 		"--max-filesize", fmt.Sprintf("%d", WhisperMaxBytes),
 		"--socket-timeout", "4",
 		"--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-		rawURL,
-	)
+	}
+	if cookiesB64 != "" {
+		cookies, err := base64.StdEncoding.DecodeString(cookiesB64)
+		if err != nil {
+			return "", errors.New("YOUTUBE_COOKIES_B64 is invalid")
+		}
+		cookieFile, err := os.CreateTemp("/tmp", "yt-cookies-*.txt")
+		if err != nil {
+			return "", errors.New("could not prepare YouTube cookies")
+		}
+		defer os.Remove(cookieFile.Name())
+		if _, err := cookieFile.Write(cookies); err != nil {
+			cookieFile.Close()
+			return "", errors.New("could not write YouTube cookies")
+		}
+		if err := cookieFile.Close(); err != nil {
+			return "", errors.New("could not close YouTube cookies")
+		}
+		args = append(args, "--cookies", cookieFile.Name())
+	}
+	args = append(args, rawURL)
+	cmd := exec.CommandContext(ctx, ytDlpPath, args...)
 
 	if err := cmd.Run(); err != nil {
+		matches, _ := filepath.Glob(prefix + ".*")
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
 		return "", fmt.Errorf("yt-dlp execution failed: %w", err)
 	}
 
-	matches, _ := filepath.Glob(fmt.Sprintf("/tmp/yt_audio_%s_*", videoID))
+	matches, _ := filepath.Glob(prefix + ".*")
 	for _, m := range matches {
 		ext := strings.ToLower(filepath.Ext(m))
 		if ext == ".m4a" || ext == ".webm" || ext == ".mp3" || ext == ".ogg" || ext == ".opus" {
@@ -279,35 +335,41 @@ func TranscribeWithGroqWhisper(ctx context.Context, audioPath, groqAPIKey string
 	return strings.TrimSpace(string(respBytes)), nil
 }
 
-func ExtractYouTube(cfg *config.Config, rawURL string) (string, []db.ChunkItem, []string, string, error) {
+func ExtractYouTube(ctx context.Context, cfg *config.Config, rawURL string) (string, []db.ChunkItem, []string, string, error) {
 	videoID := YouTubeVideoID(rawURL)
 	if videoID == "" {
 		return "", nil, nil, "", errors.New("could not find a YouTube video id in the URL")
 	}
 
-	title := YouTubeOEmbedTitle(rawURL)
+	title := YouTubeOEmbedTitle(ctx, rawURL)
 	if title == "" {
 		title = fmt.Sprintf("YouTube video %s", videoID)
 	}
 
 	// 1. Supadata transcript API
-	chunks, supaWarn := FetchViaSupadata(rawURL, cfg.SupadataAPIKey)
+	chunks, supaWarn := FetchViaSupadata(ctx, rawURL, cfg.SupadataAPIKey)
 	if len(chunks) > 0 {
 		return title, chunks, nil, "youtube", nil
 	}
 
 	// 2. Vercel edge proxy
-	chunks, edgeWarn := FetchViaEdge(videoID, cfg.EdgeTranscriptURL)
+	if ctx.Err() != nil {
+		return title, nil, []string{"Transcript processing timed out."}, "youtube", nil
+	}
+	chunks, edgeWarn := FetchViaEdge(ctx, videoID, cfg.EdgeTranscriptURL)
 	if len(chunks) > 0 {
 		return title, chunks, nil, "youtube", nil
 	}
 
 	// 3. yt-dlp + Groq Whisper
 	var whisperWarn string
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.YouTubePipelineTimeout)*time.Second)
+	if ctx.Err() != nil {
+		return title, nil, []string{"Transcript processing timed out."}, "youtube", nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.YouTubePipelineTimeout)*time.Second)
 	defer cancel()
 
-	audioPath, err := DownloadAudioYtDlp(ctx, rawURL, videoID)
+	audioPath, err := DownloadAudioYtDlp(ctx, rawURL, videoID, cfg.YouTubeCookiesB64)
 	if err == nil && audioPath != "" {
 		defer os.Remove(audioPath)
 		transcript, tErr := TranscribeWithGroqWhisper(ctx, audioPath, cfg.GroqAPIKey)

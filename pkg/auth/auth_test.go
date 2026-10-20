@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"os"
 	"testing"
 
 	"ai-research-mindmapper-go/pkg/config"
@@ -45,6 +46,9 @@ func TestAuthBypasses(t *testing.T) {
 }
 
 func TestLiveClerkJWKS(t *testing.T) {
+	if os.Getenv("RUN_LIVE_TESTS") != "1" {
+		t.Skip("set RUN_LIVE_TESTS=1 to call Clerk")
+	}
 	cfg := &config.Config{
 		ClerkPublishableKey: config.DefaultClerkPublishableKey,
 	}
@@ -57,4 +61,3 @@ func TestLiveClerkJWKS(t *testing.T) {
 		t.Fatalf("invalid parsed RSA public key: %+v", key)
 	}
 }
-

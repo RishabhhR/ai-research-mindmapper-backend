@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type Storage struct {
@@ -16,6 +17,11 @@ type Storage struct {
 
 func NewStorage(client *Client) *Storage {
 	return &Storage{client: client}
+}
+
+func (s *Storage) Ping(ctx context.Context) error {
+	_, err := s.client.Execute(ctx, "SELECT 1")
+	return err
 }
 
 func NowTS() string {
@@ -53,7 +59,10 @@ func (s *Storage) InitDB(ctx context.Context) error {
 			mindmap_json TEXT,
 			insights_json TEXT,
 			tradeoffs_json TEXT,
+			sources_json TEXT,
 			citations_json TEXT,
+			root_x REAL,
+			root_y REAL,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);
@@ -102,7 +111,6 @@ func (s *Storage) InitDB(ctx context.Context) error {
 			PRIMARY KEY (user_id, bucket)
 		);
 
-		CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, updated_at);
 		CREATE INDEX IF NOT EXISTS idx_chunks_session ON source_chunks(session_id);
 		CREATE INDEX IF NOT EXISTS idx_sources_session ON sources(session_id);
 		CREATE INDEX IF NOT EXISTS idx_qa_session ON qa_history(session_id);
@@ -113,9 +121,35 @@ func (s *Storage) InitDB(ctx context.Context) error {
 		return err
 	}
 
-	// Migrate sessions column if pre-dated
-	_, _ = s.client.Execute(ctx, "ALTER TABLE sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
+	for _, column := range []struct{ name, definition string }{
+		{"user_id", "TEXT NOT NULL DEFAULT ''"},
+		{"sources_json", "TEXT"},
+		{"root_x", "REAL"},
+		{"root_y", "REAL"},
+	} {
+		if err := s.ensureSessionColumn(ctx, column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	_, err = s.client.Execute(ctx, "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, updated_at)")
+	if err != nil {
+		return err
+	}
 	return nil
+}
+
+func (s *Storage) ensureSessionColumn(ctx context.Context, name, definition string) error {
+	res, err := s.client.Execute(ctx, "PRAGMA table_info(sessions)")
+	if err != nil {
+		return err
+	}
+	for _, row := range res.Rows() {
+		if row["name"] == name {
+			return nil
+		}
+	}
+	_, err = s.client.Execute(ctx, "ALTER TABLE sessions ADD COLUMN "+name+" "+definition)
+	return err
 }
 
 func (s *Storage) CreateSession(ctx context.Context, topic, depth, output, userID string) (string, error) {
@@ -132,15 +166,16 @@ func (s *Storage) CreateSession(ctx context.Context, topic, depth, output, userI
 	return sessionID, nil
 }
 
-func (s *Storage) SaveGeneration(ctx context.Context, sessionID, summary string, nodes, insights, tradeoffs, citations any) error {
+func (s *Storage) SaveGeneration(ctx context.Context, sessionID, summary string, nodes, insights, tradeoffs, sources, citations any) error {
 	nodesJSON, _ := json.Marshal(nodes)
 	insightsJSON, _ := json.Marshal(insights)
 	tradeoffsJSON, _ := json.Marshal(tradeoffs)
+	sourcesJSON, _ := json.Marshal(sources)
 	citationsJSON, _ := json.Marshal(citations)
 
 	query := `
 		UPDATE sessions
-		SET summary = ?, mindmap_json = ?, insights_json = ?, tradeoffs_json = ?,
+		SET summary = ?, mindmap_json = ?, insights_json = ?, tradeoffs_json = ?, sources_json = ?,
 		    citations_json = ?, updated_at = ?
 		WHERE id = ?
 	`
@@ -149,11 +184,35 @@ func (s *Storage) SaveGeneration(ctx context.Context, sessionID, summary string,
 		string(nodesJSON),
 		string(insightsJSON),
 		string(tradeoffsJSON),
+		string(sourcesJSON),
 		string(citationsJSON),
 		NowTS(),
 		sessionID,
 	)
 	return err
+}
+
+func (s *Storage) SaveMap(ctx context.Context, sessionID, userID string, nodes, insights, sources any, rootX, rootY float64) (bool, error) {
+	nodesJSON, err := json.Marshal(nodes)
+	if err != nil {
+		return false, err
+	}
+	insightsJSON, err := json.Marshal(insights)
+	if err != nil {
+		return false, err
+	}
+	sourcesJSON, err := json.Marshal(sources)
+	if err != nil {
+		return false, err
+	}
+	res, err := s.client.Execute(ctx, `
+		UPDATE sessions SET mindmap_json = ?, insights_json = ?, sources_json = ?, root_x = ?, root_y = ?, updated_at = ?
+		WHERE id = ? AND user_id = ?
+	`, string(nodesJSON), string(insightsJSON), string(sourcesJSON), rootX, rootY, NowTS(), sessionID, userID)
+	if err != nil {
+		return false, err
+	}
+	return res.RowsAffected > 0, nil
 }
 
 func (s *Storage) AddSource(ctx context.Context, sessionID, sourceType, title, url, filePath string) (string, error) {
@@ -179,15 +238,41 @@ func (s *Storage) AddSource(ctx context.Context, sessionID, sourceType, title, u
 }
 
 type ChunkItem struct {
-	Text string `json:"text"`
-	Page *int   `json:"page,omitempty"`
+	Text  string `json:"text"`
+	Title string `json:"title,omitempty"`
+	URL   string `json:"url,omitempty"`
+	Page  *int   `json:"page,omitempty"`
 }
 
 func (s *Storage) AddChunks(ctx context.Context, sessionID, sourceID, sourceType, title string, chunks []ChunkItem, url string) error {
 	if len(chunks) == 0 {
 		return nil
 	}
+	_, err := s.client.Batch(ctx, chunkStatements(sessionID, sourceID, sourceType, title, chunks, url))
+	return err
+}
 
+// AddSourceWithChunks saves the source and its searchable text in one transaction.
+// A failed chunk insert must not leave a source that appears imported but cannot
+// answer questions.
+func (s *Storage) AddSourceWithChunks(ctx context.Context, sessionID, sourceType, title, url string, chunks []ChunkItem) (string, error) {
+	if len(chunks) == 0 {
+		return "", fmt.Errorf("source has no readable chunks")
+	}
+	sourceID := NewID("src")
+	var urlVal any
+	if url != "" {
+		urlVal = url
+	}
+	statements := []Statement{{SQL: `INSERT INTO sources (id, session_id, source_type, title, url, file_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, Args: []any{sourceID, sessionID, sourceType, title, urlVal, nil, NowTS()}}}
+	statements = append(statements, chunkStatements(sessionID, sourceID, sourceType, title, chunks, url)...)
+	if _, err := s.client.Batch(ctx, statements); err != nil {
+		return "", err
+	}
+	return sourceID, nil
+}
+
+func chunkStatements(sessionID, sourceID, sourceType, title string, chunks []ChunkItem, url string) []Statement {
 	created := NowTS()
 	const rowsPerStmt = 40
 	statements := make([]Statement, 0, (len(chunks)+rowsPerStmt-1)/rowsPerStmt)
@@ -234,8 +319,7 @@ func (s *Storage) AddChunks(ctx context.Context, sessionID, sourceID, sourceType
 		statements = append(statements, Statement{SQL: sql, Args: params})
 	}
 
-	_, err := s.client.Batch(ctx, statements)
-	return err
+	return statements
 }
 
 func (s *Storage) GetSession(ctx context.Context, sessionID, userID string) (map[string]any, error) {
@@ -268,7 +352,7 @@ func (s *Storage) GetChunks(ctx context.Context, sessionID string, limit int) ([
 	query := `
 		SELECT * FROM source_chunks
 		WHERE session_id = ?
-		ORDER BY source_id, chunk_index
+		ORDER BY chunk_index, source_id
 		LIMIT ?
 	`
 	res, err := s.client.Execute(ctx, query, sessionID, limit)
@@ -276,6 +360,49 @@ func (s *Storage) GetChunks(ctx context.Context, sessionID string, limit int) ([
 		return nil, err
 	}
 	return res.Rows(), nil
+}
+
+// GetRelevantChunks searches every chunk in a session before the answer path
+// ranks the matches. This avoids losing later pages behind a fixed first-page limit.
+func (s *Storage) GetRelevantChunks(ctx context.Context, sessionID, question string, limit int) ([]map[string]any, error) {
+	stopwords := map[string]bool{"what": true, "which": true, "where": true, "when": true, "whose": true, "with": true, "from": true, "about": true, "this": true, "that": true, "does": true, "were": true, "have": true, "there": true, "their": true}
+	seen := make(map[string]bool)
+	var terms []string
+	for _, term := range strings.FieldsFunc(strings.ToLower(question), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
+		if len(term) < 4 || stopwords[term] || seen[term] {
+			continue
+		}
+		seen[term] = true
+		terms = append(terms, term)
+		if len(terms) == 8 {
+			break
+		}
+	}
+	if len(terms) == 0 {
+		return s.GetChunks(ctx, sessionID, limit)
+	}
+	conditions := make([]string, len(terms))
+	scores := make([]string, len(terms))
+	args := make([]any, 0, len(terms)*2+2)
+	args = append(args, sessionID)
+	for i, term := range terms {
+		conditions[i] = "lower(text) LIKE ?"
+		scores[i] = "CASE WHEN lower(text) LIKE ? THEN 1 ELSE 0 END"
+		args = append(args, "%"+term+"%")
+	}
+	for _, term := range terms {
+		args = append(args, "%"+term+"%")
+	}
+	args = append(args, limit)
+	query := "SELECT * FROM source_chunks WHERE session_id = ? AND (" + strings.Join(conditions, " OR ") + ") ORDER BY (" + strings.Join(scores, " + ") + ") DESC, chunk_index, source_id LIMIT ?"
+	res, err := s.client.Execute(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	if len(res.Rows()) > 0 {
+		return res.Rows(), nil
+	}
+	return s.GetChunks(ctx, sessionID, 4)
 }
 
 func (s *Storage) GetSources(ctx context.Context, sessionID string) ([]map[string]any, error) {
@@ -327,6 +454,30 @@ func (s *Storage) DeleteSession(ctx context.Context, sessionID, userID string) (
 		return false, err
 	}
 	return true, nil
+}
+
+func (s *Storage) DeleteAllSessions(ctx context.Context, userID string) (int64, error) {
+	if userID == "" {
+		return 0, fmt.Errorf("user id is required")
+	}
+	query := "SELECT id FROM sessions WHERE user_id = ?"
+	res, err := s.client.Execute(ctx, query, userID)
+	if err != nil {
+		return 0, err
+	}
+	count := int64(len(res.Rows()))
+	if count == 0 {
+		return 0, nil
+	}
+	stmts := []Statement{
+		{SQL: "DELETE FROM source_chunks WHERE session_id IN (SELECT id FROM sessions WHERE user_id = ?)", Args: []any{userID}},
+		{SQL: "DELETE FROM sources WHERE session_id IN (SELECT id FROM sessions WHERE user_id = ?)", Args: []any{userID}},
+		{SQL: "DELETE FROM qa_history WHERE session_id IN (SELECT id FROM sessions WHERE user_id = ?)", Args: []any{userID}},
+		{SQL: "DELETE FROM jobs WHERE session_id IN (SELECT id FROM sessions WHERE user_id = ?)", Args: []any{userID}},
+		{SQL: "DELETE FROM sessions WHERE user_id = ?", Args: []any{userID}},
+	}
+	_, err = s.client.Batch(ctx, stmts)
+	return count, err
 }
 
 func (s *Storage) BumpRateCounters(ctx context.Context, userID, minuteBucket, dayBucket string) (int, int, error) {
@@ -413,6 +564,20 @@ func (s *Storage) GetJob(ctx context.Context, jobID, userID string) (map[string]
 		}
 	}
 	return job, nil
+}
+
+// ClaimJob lets a poll request run a pending job. A timed-out serverless
+// invocation can be retried after its processing lease expires.
+func (s *Storage) ClaimJob(ctx context.Context, jobID string) (bool, error) {
+	staleBefore := time.Now().UTC().Add(-50 * time.Second).Format("2006-01-02T15:04:05Z")
+	res, err := s.client.Execute(ctx, `
+		UPDATE jobs SET status = 'processing', updated_at = ?
+		WHERE id = ? AND (status = 'pending' OR (status = 'processing' AND updated_at < ?))
+	`, NowTS(), jobID, staleBefore)
+	if err != nil {
+		return false, err
+	}
+	return res.RowsAffected > 0, nil
 }
 
 func (s *Storage) UpdateJob(ctx context.Context, jobID, status string, result any, errorMsg string) error {

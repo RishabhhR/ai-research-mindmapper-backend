@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/url"
@@ -50,4 +51,35 @@ func isPrivateOrReservedIP(ip net.IP) bool {
 		}
 	}
 	return false
+}
+
+// DialPublic resolves the host at connection time and dials the checked IP.
+// This keeps DNS changes between URL validation and connection from reaching
+// private services.
+func DialPublic(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	var ips []net.IP
+	if literal := net.ParseIP(host); literal != nil {
+		ips = []net.IP{literal}
+	} else {
+		resolved, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, errors.New("could not resolve the URL's host")
+		}
+		for _, addr := range resolved {
+			ips = append(ips, addr.IP)
+		}
+	}
+	if len(ips) == 0 {
+		return nil, errors.New("could not resolve the URL's host")
+	}
+	for _, ip := range ips {
+		if isPrivateOrReservedIP(ip) {
+			return nil, errors.New("URL points to a private or internal address")
+		}
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
 }

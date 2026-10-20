@@ -23,7 +23,9 @@ type Config struct {
 	GroqAPIKey             string
 	GroqModel              string
 	GeminiAPIKey           string
+	GeminiModel            string
 	OpenRouterAPIKey       string
+	OpenRouterModel        string
 	RateLimitLLMPerMin     int
 	RateLimitLLMPerDay     int
 	RateLimitIngestPerMin  int
@@ -47,7 +49,7 @@ func Load() *Config {
 	cfg := &Config{
 		Port:                   getEnv("PORT", "8008"),
 		LogLevel:               getEnv("LOG_LEVEL", "INFO"),
-		AppVersion:             "1.1.0",
+		AppVersion:             "1.2.0",
 		BackendURL:             strings.TrimRight(getEnv("BACKEND_URL", "https://mindmapper-api-mu.vercel.app"), "/"),
 		InternalSecret:         getEnv("INTERNAL_SECRET", ""),
 		TursoURL:               getEnv("TURSO_URL", ""),
@@ -59,14 +61,16 @@ func Load() *Config {
 		GroqAPIKey:             getEnv("GROQ_API_KEY", ""),
 		GroqModel:              getEnv("GROQ_MODEL", "qwen/qwen3.8-27b"),
 		GeminiAPIKey:           getEnv("GEMINI_API_KEY", ""),
+		GeminiModel:            getEnv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
 		OpenRouterAPIKey:       getEnv("OPENROUTER_API_KEY", ""),
+		OpenRouterModel:        getEnv("OPENROUTER_MODEL", "openai/gpt-oss-20b"),
 		RateLimitLLMPerMin:     getEnvInt("RATE_LIMIT_LLM_PER_MIN", 6),
 		RateLimitLLMPerDay:     getEnvInt("RATE_LIMIT_LLM_PER_DAY", 120),
 		RateLimitIngestPerMin:  getEnvInt("RATE_LIMIT_INGEST_PER_MIN", 12),
 		RateLimitIngestPerDay:  getEnvInt("RATE_LIMIT_INGEST_PER_DAY", 200),
 		RateLimitDisabled:      getEnv("RATE_LIMIT_DISABLED", "") == "1",
 		SupadataAPIKey:         getEnv("SUPADATA_API_KEY", ""),
-		EdgeTranscriptURL:      getEnv("EDGE_TRANSCRIPT_URL", ""),
+		EdgeTranscriptURL:      getEnv("EDGE_TRANSCRIPT_URL", "https://mindmapper-app-zeta.vercel.app/api/yt-transcript"),
 		YouTubeCookiesB64:      getEnv("YOUTUBE_COOKIES_B64", ""),
 		YouTubePipelineTimeout: getEnvInt("YOUTUBE_PIPELINE_TIMEOUT", 50),
 		YouTubeStatus:          getEnv("YOUTUBE_STATUS", "ok"),
@@ -79,6 +83,7 @@ func Load() *Config {
 		"http://localhost:4173",
 		"http://127.0.0.1:4173",
 		"https://research-mindmapper-vite.vercel.app",
+		"https://mindmapper-app-zeta.vercel.app",
 	}
 
 	for _, key := range []string{"FRONTEND_URL", "FRONTEND_URLS"} {
