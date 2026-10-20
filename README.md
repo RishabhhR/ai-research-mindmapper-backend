@@ -1,95 +1,46 @@
-# AI Research Mindmapper — Go Backend
+# AI Research Mindmapper — Go backend
 
-High-performance Go backend rewrite of the AI Research Mindmapper API, providing instant cold starts (<5ms), minimal memory footprint, and robust concurrency for web research, YouTube transcription, and mindmap generation.
+This is the active API for the Research Mindmapper frontend. The Python backend is legacy. The Go service uses Clerk JWT authentication, Turso storage, Groq/Gemini/OpenRouter for synthesis, and optional transcript providers for YouTube.
 
----
+## Run locally
 
-## ⚡ Key Improvements over Python Backend
-
-| Feature | Python (FastAPI + uvicorn) | Go (Chi + native net/http) |
-|---|---|---|
-| **Cold Start** | ~1.5s – 3.0s | **< 5ms** |
-| **Memory Footprint** | ~120MB – 250MB | **~15MB – 25MB** |
-| **Concurrency** | ThreadPoolExecutor + async event loop | **Native lightweight goroutines** |
-| **Packaging** | Python runtime + venv + site-packages | **Single static executable binary** |
-| **Database Driver** | Python `libsql-client` | **Native HTTP LibSQL pipeline (zero-CGO)** |
-
----
-
-## 🏛 Architecture
-
-```
-cmd/server/
-  └── main.go          Entrypoint, graceful signal shutdown, config injection
-pkg/
-  ├── auth/            Clerk RS256 JWKS verification + test & extension bypass keys
-  ├── config/          Environment variables loader (.env & system env)
-  ├── db/              Turso / LibSQL HTTP client (v1/execute & v1/batch), migrations, storage repository
-  ├── handler/         Chi HTTP router, CORS middleware, REST endpoints
-  ├── ingest/          Text chunker, SSRF firewall, webpage extractor (goquery), PDF & TXT, YouTube
-  ├── llm/             Groq (Llama 3.1) → Gemini → OpenRouter fallback chain & offline synthesis
-  └── ratelimit/       Database-backed sliding windows (per-minute and per-day) with fail-open
-```
-
----
-
-## 🚀 Getting Started
-
-### Prerequisites
-- Go 1.22+ (tested on Go 1.27.2)
-- Turso Database (`TURSO_URL` and `TURSO_AUTH_TOKEN`)
-
-### Quick Start
-
-1. Copy `.env.example` to `.env` and fill in your keys:
-   ```bash
-   cp .env.example .env
-   ```
-
-2. Build and run the server:
-   ```bash
-   go build -o bin/server cmd/server/main.go
-   ./bin/server
-   ```
-   Or run directly with live reload / go run:
-   ```bash
-   go run cmd/server/main.go
-   ```
-
-3. Run the automated test suite:
-   ```bash
-   go test ./... -v
-   ```
-
----
-
-## 🐳 Docker Deployment
-
-Build and run using the lightweight multi-stage Dockerfile:
+Requires Go 1.27+, `TURSO_URL`, `TURSO_AUTH_TOKEN`, the frontend's `CLERK_PUBLISHABLE_KEY`, and at least one of `GROQ_API_KEY`, `GEMINI_API_KEY`, or `OPENROUTER_API_KEY` for AI generation. Copy `.env.example` to `.env`, fill in the values, then run:
 
 ```bash
-# Build Docker image
-docker build -t mindmapper-backend-go .
+go run ./cmd/server
+```
 
-# Run container with environment file
+The server listens on port 8008 by default. `go test ./...` runs local tests; `RUN_LIVE_TESTS=1 go test ./...` calls real providers and Turso. Live tests can consume provider quota and write temporary database records.
+
+## What the API does
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/health` | Checks service and storage availability |
+| POST | `/api/research` | Creates an AI topic overview |
+| POST | `/api/sources` | Imports a webpage, YouTube video, TXT, or PDF |
+| GET | `/api/jobs/{id}` | Polls and processes an authenticated YouTube import |
+| POST | `/api/sessions/{id}/generate` | Creates a map from stored source text |
+| POST | `/api/sessions/{id}/ask` | Answers with retrieved source excerpts |
+| GET | `/api/sessions` | Lists the signed-in user's sessions |
+| GET | `/api/sessions/{id}` | Returns a session, sources, excerpts, and Q&A |
+| PUT | `/api/sessions/{id}/map` | Saves map edits and node positions |
+| DELETE | `/api/sessions/{id}` | Deletes one session |
+| DELETE | `/api/sessions` | Deletes all sessions for the signed-in user |
+
+All routes except health require a Clerk bearer token. `/api/internal/jobs/{id}/run` additionally requires `X-Internal-Secret` if configured.
+
+Topic overviews use model knowledge and are labelled AI synthesis. There is currently **no live web search tool**; entering a topic does not retrieve web pages or academic papers. Import a source for evidence-backed maps and answers. Source retrieval is lexical, not semantic; answers may miss paraphrases or material absent from the selected excerpts.
+
+YouTube transcripts try Supadata, the frontend edge transcript endpoint, then local `yt-dlp` if available. The Vercel Go runtime does not include `yt-dlp`; deploy the Docker image or configure a working transcript service for that fallback. The Docker image includes `yt-dlp`, and `YOUTUBE_COOKIES_B64` can supply its cookies. Some videos still block transcript access.
+
+## Deployment
+
+`vercel.json` builds `api/index.go` as the Vercel entrypoint. For a standalone server with the YouTube CLI fallback:
+
+```bash
+docker build -t mindmapper-backend-go .
 docker run -p 8008:8008 --env-file .env mindmapper-backend-go
 ```
 
----
-
-## 📡 API Surface
-
-All routes except `/api/health` require `Authorization: Bearer <Clerk JWT>` (or bypass key).
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/health` | Healthcheck, YouTube status, version |
-| `POST` | `/api/research` | Generates mindmap from topic string |
-| `POST` | `/api/sources` | Ingests URL (article/YouTube) or uploaded file (.txt/.pdf) |
-| `GET` | `/api/jobs/{id}` | Polls async job status (used for YouTube audio processing) |
-| `POST` | `/api/internal/jobs/{id}/run` | Worker endpoint for processing queued jobs |
-| `POST` | `/api/sessions/{id}/generate` | Synthesizes mindmap from stored session evidence |
-| `POST` | `/api/sessions/{id}/ask` | Q&A with semantic ranking over evidence chunks |
-| `GET` | `/api/sessions` | Lists user's research sessions |
-| `GET` | `/api/sessions/{id}` | Session details, sources, chunks, and Q&A history |
-| `DELETE` | `/api/sessions/{id}` | Deletes session and cascade-deletes related rows |
+The package layout is `pkg/auth`, `pkg/config`, `pkg/db`, `pkg/handler`, `pkg/ingest`, `pkg/llm`, and `pkg/ratelimit`. Database migrations run at startup. Source import and chunk insertion are transactional; storage failures return an error rather than reporting a saved map.

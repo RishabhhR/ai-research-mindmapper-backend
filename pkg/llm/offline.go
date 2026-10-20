@@ -2,97 +2,50 @@ package llm
 
 import (
 	"fmt"
-	"sort"
+	"strings"
 
 	"ai-research-mindmapper-go/pkg/db"
 )
 
-func OfflineGeneration(topic string, evidenceChunks []db.ChunkItem, provenance string) ResearchPayload {
-	if provenance == "" {
-		provenance = "ai_synthesized"
-	}
-
-	summary := fmt.Sprintf("Research map for %s. Set GROQ_API_KEY to enable Groq Compound search and higher quality synthesis.", topic)
-	if len(evidenceChunks) > 0 {
-		summary = fmt.Sprintf("Evidence-backed research map for %s using %d local evidence chunks.", topic, len(evidenceChunks))
-	}
-
-	// Distinct source titles up to 4
-	titleMap := make(map[string]bool)
-	var titles []string
-	for range evidenceChunks {
-		t := "Provided evidence"
-		if !titleMap[t] {
-			titleMap[t] = true
-			titles = append(titles, t)
+// OfflineGeneration is an extractive fallback. It never invents findings.
+func OfflineGeneration(topic string, evidenceChunks []db.ChunkItem, _ string) ResearchPayload {
+	if len(evidenceChunks) == 0 {
+		return ResearchPayload{
+			Degraded:   true,
+			Summary:    "Research models are unavailable. Please try again later.",
+			Warnings:   []string{"Research models are unavailable."},
+			Provenance: "ai_synthesized",
 		}
 	}
-	sort.Strings(titles)
-	if len(titles) > 4 {
-		titles = titles[:4]
-	}
 
-	evidenceProv := provenance
-	if len(evidenceChunks) > 0 {
-		evidenceProv = "source_grounded"
-	}
-
-	nodes := []Node{
-		{Title: "Context", Description: "Frame the core question and constraints.", X: 8, Y: 11, Provenance: provenance},
-		{Title: "Evidence", Description: "Use provided material before web expansion.", X: 70, Y: 12, Provenance: evidenceProv},
-		{Title: "Patterns", Description: "Cluster recurring concepts and claims.", X: 8, Y: 58, Provenance: provenance},
-		{Title: "Trade-offs", Description: "Separate tensions, risks, and open questions.", X: 70, Y: 58, Provenance: provenance},
-		{Title: "Next research", Description: "Identify gaps and follow-up searches.", X: 39, Y: 78, Provenance: provenance},
-	}
-
-	insights := []Insight{
-		{Title: "Evidence-first workflow", Body: "Local sources should answer questions before web search is used.", Provenance: evidenceProv},
-		{Title: "Traceable synthesis", Body: "Generated claims are labeled separately from source-backed material.", Provenance: "ai_synthesized"},
-		{Title: "Research gaps stay visible", Body: "The map keeps unanswered areas available for follow-up questions.", Provenance: provenance},
-	}
-
-	var sources []Source
-	for _, title := range titles {
-		sources = append(sources, Source{
-			Title:      title,
-			Type:       "Provided evidence",
-			Confidence: "High",
-			Body:       "Stored local evidence source.",
-			Provenance: "source_grounded",
-			URL:        "",
-		})
-	}
-
-	tradeoffs := []Tradeoff{
-		{Title: "Coverage vs. cost", Body: "The system limits token usage by searching local evidence before web search.", Provenance: "ai_synthesized"},
-		{Title: "Speed vs. nuance", Body: "Fast summaries need citations and provenance labels to remain trustworthy.", Provenance: "ai_synthesized"},
-	}
-
-	var citations []Citation
-	for i, chunk := range evidenceChunks {
-		if i >= 6 {
+	positions := [][2]float64{{8, 11}, {70, 12}, {8, 58}, {70, 58}, {39, 78}, {39, 5}}
+	nodes := make([]Node, 0, 6)
+	for _, chunk := range evidenceChunks {
+		if len(nodes) >= len(positions) {
 			break
 		}
-		snippet := chunk.Text
-		if len(snippet) > 220 {
-			snippet = snippet[:220]
+		body := strings.TrimSpace(chunk.Text)
+		if body == "" {
+			continue
 		}
-		citations = append(citations, Citation{
-			Title:      "Evidence",
-			URL:        "",
-			Snippet:    snippet,
-			Provenance: "source_grounded",
-		})
+		if len(body) > 240 {
+			body = body[:240] + "…"
+		}
+		title := chunk.Title
+		if title == "" {
+			title = fmt.Sprintf("Evidence excerpt %d", len(nodes)+1)
+		}
+		pos := positions[len(nodes)]
+		nodes = append(nodes, Node{Title: title, Description: body, X: pos[0], Y: pos[1], Provenance: "source_grounded"})
 	}
 
 	return ResearchPayload{
-		Summary:    summary,
+		Degraded:   true,
+		Summary:    fmt.Sprintf("AI synthesis is unavailable. Showing %d excerpts from the sources for %s.", len(nodes), topic),
 		Nodes:      nodes,
-		Insights:   insights,
-		Sources:    sources,
-		Tradeoffs:  tradeoffs,
-		Citations:  citations,
-		Warnings:   []string{"GROQ_API_KEY is not set; returned local fallback output."},
-		Provenance: provenance,
+		Sources:    groundedSources(evidenceChunks),
+		Citations:  groundedCitations(evidenceChunks, 6),
+		Warnings:   []string{"AI synthesis is unavailable; showing source excerpts only."},
+		Provenance: "source_grounded",
 	}
 }

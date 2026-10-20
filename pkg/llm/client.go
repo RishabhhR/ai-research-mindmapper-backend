@@ -59,10 +59,10 @@ var depthProfiles = map[string]depthProfile{
 }
 
 var outputProfiles = map[string]string{
-	"Mindmap": "Structure output as an interconnected concept graph. Nodes should represent distinct sub-concepts with descriptive titles. Insights highlight cross-cutting themes. Tradeoffs capture conceptual tensions between nodes.",
-	"Report": "Structure output as a formal research report. The summary should read as an executive introduction. Nodes represent main sections (e.g., Background, Findings, Methodology, Implications, Gaps). Insights should be structured as numbered findings. Tradeoffs should frame competing schools of thought or methodological debates.",
+	"Mindmap":    "Structure output as an interconnected concept graph. Nodes should represent distinct sub-concepts with descriptive titles. Insights highlight cross-cutting themes. Tradeoffs capture conceptual tensions between nodes.",
+	"Report":     "Structure output as a formal research report. The summary should read as an executive introduction. Nodes represent main sections (e.g., Background, Findings, Methodology, Implications, Gaps). Insights should be structured as numbered findings. Tradeoffs should frame competing schools of thought or methodological debates.",
 	"Comparison": "Structure output as a comparative analysis. Each node should represent one distinct approach, technology, framework, or perspective being compared. Insights should explicitly contrast two or more options (use 'vs.' phrasing). Tradeoffs must contain concrete pros and cons for each compared option. Sources should prioritize comparative studies and benchmarks.",
-	"Bullets": "Structure output for fast scanning. The summary must be a single string containing 3–5 punchy bullet points separated by newline characters (\\n) — NOT a JSON array, always a string. Node descriptions should be single-sentence takeaways. Insights should each contain one key fact or statistic. Tradeoffs should be formatted as 'Pro: ... / Con: ...' pairs.",
+	"Bullets":    "Structure output for fast scanning. The summary must be a single string containing 3–5 punchy bullet points separated by newline characters (\\n) — NOT a JSON array, always a string. Node descriptions should be single-sentence takeaways. Insights should each contain one key fact or statistic. Tradeoffs should be formatted as 'Pro: ... / Con: ...' pairs.",
 }
 
 var sourceProfiles = map[string]string{
@@ -138,7 +138,11 @@ func (c *Client) callGemini(ctx context.Context, systemPrompt, userPrompt string
 		return llmCallResult{Offline: true, Content: "", Warning: "GEMINI_API_KEY not set"}
 	}
 
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=%s", c.cfg.GeminiAPIKey)
+	model := c.cfg.GeminiModel
+	if model == "" {
+		model = "gemini-3.5-flash-lite"
+	}
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent", model)
 
 	reqBody := map[string]any{
 		"systemInstruction": map[string]any{
@@ -162,6 +166,7 @@ func (c *Client) callGemini(ctx context.Context, systemPrompt, userPrompt string
 		return llmCallResult{Offline: true, Warning: err.Error()}
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", c.cfg.GeminiAPIKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -197,10 +202,15 @@ func (c *Client) callOpenRouter(ctx context.Context, messages []ChatMessage, tim
 		return llmCallResult{Offline: true, Content: "", Warning: "OPENROUTER_API_KEY not set"}
 	}
 
+	model := c.cfg.OpenRouterModel
+	if model == "" {
+		model = "openai/gpt-oss-20b"
+	}
 	reqBody := map[string]any{
-		"model":       "mistralai/mistral-7b-instruct",
-		"messages":    messages,
-		"temperature": 0.2,
+		"model":           model,
+		"messages":        messages,
+		"temperature":     0.2,
+		"response_format": map[string]string{"type": "json_object"},
 	}
 
 	b, _ := json.Marshal(reqBody)
@@ -275,16 +285,16 @@ func (c *Client) CallLLMWithFallback(ctx context.Context, messages []ChatMessage
 		return openRouterRes
 	}
 
-	return res
+	return llmCallResult{Offline: true, Warning: "All configured research models are unavailable."}
 }
 
 func buildMindmapPrompt(topic, depth, output, source, evidence string, webSearch bool) []ChatMessage {
 	provenance := "source_grounded"
 	if webSearch {
-		provenance = "web_enriched"
+		provenance = "ai_synthesized"
 	}
 
-	sourceBlock := "No local evidence was provided."
+	sourceBlock := "No source text was provided. Use general model knowledge only. Do not invent source titles, URLs, citations, or claim web search was performed."
 	if evidence != "" {
 		if len(evidence) > 12000 {
 			evidence = evidence[:12000]
@@ -304,10 +314,14 @@ func buildMindmapPrompt(topic, depth, output, source, evidence string, webSearch
 	if !ok {
 		sp = sourceProfiles["Academic + web"]
 	}
+	if webSearch {
+		sp = "No external search results were retrieved. Use general model knowledge and mark every claim as AI synthesis."
+	}
 
 	systemPrompt := "Return only valid JSON. You are a structured research synthesis engine. " +
 		"Every insight, node, tradeoff, source, and citation must include a provenance field " +
-		"whose value is exactly one of: 'source_grounded', 'ai_synthesized', or 'web_enriched'."
+		"whose value is exactly one of: 'source_grounded', 'ai_synthesized', or 'web_enriched'. " +
+		"Only claim source_grounded when the claim appears in provided evidence. Do not fabricate sources or citations."
 
 	userPrompt := fmt.Sprintf(`Topic: %s
 
@@ -355,14 +369,14 @@ func parseJSONOrFallback(content string, fallback ResearchPayload) (ResearchPayl
 	}
 
 	var parsed ResearchPayload
-	if err := json.Unmarshal([]byte(content), &parsed); err == nil && parsed.Summary != "" {
+	if err := json.Unmarshal([]byte(content), &parsed); err == nil && parsed.Summary != "" && len(parsed.Nodes) > 0 {
 		return parsed, true
 	}
 
 	// Regex search for { ... }
 	match := jsonBlockRegex.FindString(content)
 	if match != "" {
-		if err := json.Unmarshal([]byte(match), &parsed); err == nil && parsed.Summary != "" {
+		if err := json.Unmarshal([]byte(match), &parsed); err == nil && parsed.Summary != "" && len(parsed.Nodes) > 0 {
 			return parsed, true
 		}
 	}
@@ -381,22 +395,44 @@ func (c *Client) GenerateResearch(ctx context.Context, topic, depth, output, sou
 		if i >= 10 {
 			break
 		}
-		evidenceLines = append(evidenceLines, fmt.Sprintf("[%d] %s", i+1, chk.Text))
+		evidenceLines = append(evidenceLines, fmt.Sprintf("[%d] %s (%s): %s", i+1, chk.Title, chk.URL, chk.Text))
 	}
 	evidenceText := strings.Join(evidenceLines, "\n\n")
 
-	fallbackProv := "source_grounded"
-	if webSearch {
-		fallbackProv = "web_enriched"
+	fallbackProv := "ai_synthesized"
+	if len(chunks) > 0 {
+		fallbackProv = "source_grounded"
 	}
 	fallback := OfflineGeneration(topic, chunks, fallbackProv)
+	finish := func(data ResearchPayload) ResearchPayload {
+		data = normalizePayload(data)
+		if len(chunks) > 0 {
+			data.Sources = groundedSources(chunks)
+			data.Citations = groundedCitations(chunks, 6)
+		} else {
+			data.Sources = nil
+			data.Citations = nil
+			data.Provenance = "ai_synthesized"
+			for i := range data.Nodes {
+				data.Nodes[i].Provenance = "ai_synthesized"
+			}
+			for i := range data.Insights {
+				data.Insights[i].Provenance = "ai_synthesized"
+			}
+			for i := range data.Tradeoffs {
+				data.Tradeoffs[i].Provenance = "ai_synthesized"
+			}
+			data.Warnings = append(data.Warnings, "No source text was provided. This is an AI overview, not verified web research.")
+		}
+		return data
+	}
 
 	deadline := time.Now().Add(time.Duration(c.cfg.GenerateBudgetSeconds) * time.Second)
 	messages := buildMindmapPrompt(topic, depth, output, source, evidenceText, webSearch)
 
 	var lastRes llmCallResult
 	for attempt := 0; attempt < 2; attempt++ {
-		lastRes = c.CallLLMWithFallback(ctx, messages, 25, 3)
+		lastRes = c.CallLLMWithFallback(ctx, messages, 10, 3)
 		if lastRes.Offline {
 			break
 		}
@@ -406,7 +442,7 @@ func (c *Client) GenerateResearch(ctx context.Context, topic, depth, output, sou
 			if lastRes.FallbackWarning != "" {
 				data.Warnings = append(data.Warnings, lastRes.FallbackWarning)
 			}
-			return normalizePayload(data)
+			return finish(data)
 		}
 
 		if time.Now().After(deadline.Add(-25 * time.Second)) {
@@ -424,21 +460,83 @@ func (c *Client) GenerateResearch(ctx context.Context, topic, depth, output, sou
 		fallback.Warnings = append(fallback.Warnings, "Models returned invalid JSON repeatedly. Showing fallback.")
 	}
 
-	return normalizePayload(fallback)
+	return finish(fallback)
+}
+
+func groundedCitations(chunks []db.ChunkItem, limit int) []Citation {
+	var citations []Citation
+	for _, chunk := range chunks {
+		if len(citations) >= limit {
+			break
+		}
+		if strings.TrimSpace(chunk.Text) == "" {
+			continue
+		}
+		snippet := chunk.Text
+		if len(snippet) > 220 {
+			snippet = snippet[:220]
+		}
+		title := chunk.Title
+		if title == "" {
+			title = "Provided evidence"
+		}
+		citations = append(citations, Citation{Title: title, URL: chunk.URL, Snippet: snippet, Page: chunk.Page, Provenance: "source_grounded"})
+	}
+	return citations
+}
+
+func groundedSources(chunks []db.ChunkItem) []Source {
+	seen := make(map[string]bool)
+	var sources []Source
+	for _, chunk := range chunks {
+		title := chunk.Title
+		if title == "" {
+			title = "Provided evidence"
+		}
+		key := title + "\x00" + chunk.URL
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		body := chunk.Text
+		if len(body) > 220 {
+			body = body[:220]
+		}
+		sources = append(sources, Source{Title: title, Type: "Imported source", Confidence: "High", Body: body, Provenance: "source_grounded", URL: chunk.URL})
+	}
+	return sources
 }
 
 func (c *Client) AnswerQuestion(ctx context.Context, question string, chunks []db.ChunkItem, useWeb bool) QAPayload {
+	_ = useWeb // No search tool is configured; answers use stored evidence or model knowledge.
 	var evidenceLines []string
 	for i, chk := range chunks {
 		if i >= 8 {
 			break
 		}
-		evidenceLines = append(evidenceLines, fmt.Sprintf("[%d] %s", i+1, chk.Text))
+		evidenceLines = append(evidenceLines, fmt.Sprintf("[%d] %s (%s): %s", i+1, chk.Title, chk.URL, chk.Text))
 	}
 	evidenceText := strings.Join(evidenceLines, "\n\n")
+	finish := func(data QAPayload) QAPayload {
+		if len(chunks) > 0 {
+			if data.EvidenceSufficient {
+				data.Citations = groundedCitations(chunks, 5)
+				data.Provenance = "source_grounded"
+			} else {
+				data.Citations = nil
+				data.Provenance = "ai_synthesized"
+			}
+		} else {
+			data.Citations = nil
+			data.Provenance = "ai_synthesized"
+			data.EvidenceSufficient = false
+			data.Warnings = append(data.Warnings, "No source text is available for this session. This answer is not source verified.")
+		}
+		return data
+	}
 
-	if c.cfg.GroqAPIKey == "" {
-		answer := "Set GROQ_API_KEY to answer questions that require web search or LLM synthesis."
+	if c.cfg.GroqAPIKey == "" && c.cfg.GeminiAPIKey == "" && c.cfg.OpenRouterAPIKey == "" {
+		answer := "The research model is unavailable. Please try again later."
 		prov := "ai_synthesized"
 		if len(chunks) > 0 {
 			first := chunks[0].Text
@@ -449,37 +547,21 @@ func (c *Client) AnswerQuestion(ctx context.Context, question string, chunks []d
 			prov = "source_grounded"
 		}
 
-		var citations []Citation
-		for i, chk := range chunks {
-			if i >= 5 {
-				break
-			}
-			snip := chk.Text
-			if len(snip) > 220 {
-				snip = snip[:220]
-			}
-			citations = append(citations, Citation{
-				Title:      "Evidence",
-				Snippet:    snip,
-				Provenance: "source_grounded",
-			})
-		}
-
-		return QAPayload{
+		return finish(QAPayload{
+			Degraded:           true,
 			Answer:             answer,
 			Provenance:         prov,
-			Citations:          citations,
 			EvidenceSufficient: len(chunks) > 0,
-			Warnings:           []string{"GROQ_API_KEY is not set; returned local fallback answer."},
-		}
+			Warnings:           []string{"Research model is unavailable; showing an extractive answer."},
+		})
 	}
 
-	mode := "Use only the provided evidence."
-	if useWeb {
-		mode = "Use the evidence first. If insufficient, use web search."
+	mode := "Use only the provided evidence. If it does not answer the question, say so clearly."
+	if len(chunks) == 0 {
+		mode = "No evidence was supplied. Give a clearly qualified general answer without sources or citations."
 	}
 
-	systemPrompt := "Return only valid JSON with keys answer, provenance, citations, evidence_sufficient."
+	systemPrompt := "Return only valid JSON with keys answer, provenance, citations, evidence_sufficient. Do not claim to have searched the web or fabricate citations."
 	userPrompt := fmt.Sprintf(`Question: %s
 Mode: %s
 
@@ -494,9 +576,9 @@ Return citations as objects with title, url, snippet, provenance. Output must be
 		{Role: "user", Content: userPrompt},
 	}
 
-	prov := "source_grounded"
-	if useWeb {
-		prov = "web_enriched"
+	prov := "ai_synthesized"
+	if len(chunks) > 0 {
+		prov = "source_grounded"
 	}
 
 	fallbackQA := QAPayload{
@@ -505,31 +587,20 @@ Return citations as objects with title, url, snippet, provenance. Output must be
 		EvidenceSufficient: len(chunks) > 0,
 	}
 
-	callRes := c.CallLLMWithFallback(ctx, messages, 15, 2)
+	callRes := c.CallLLMWithFallback(ctx, messages, 8, 3)
 	if callRes.Offline {
+		fallbackQA.Degraded = true
 		if len(chunks) > 0 {
 			snip := chunks[0].Text
 			if len(snip) > 500 {
 				snip = snip[:500]
 			}
 			fallbackQA.Answer = fmt.Sprintf("Based on the provided evidence, the closest answer is: %s", snip)
-			for i, chk := range chunks {
-				if i >= 5 {
-					break
-				}
-				s := chk.Text
-				if len(s) > 220 {
-					s = s[:220]
-				}
-				fallbackQA.Citations = append(fallbackQA.Citations, Citation{
-					Title:      "Evidence",
-					Snippet:    s,
-					Provenance: "source_grounded",
-				})
-			}
+		} else {
+			fallbackQA.Answer = "The research model is unavailable. Please try again later."
 		}
 		fallbackQA.Warnings = []string{callRes.Warning}
-		return fallbackQA
+		return finish(fallbackQA)
 	}
 
 	var parsed QAPayload
@@ -537,7 +608,7 @@ Return citations as objects with title, url, snippet, provenance. Output must be
 		if callRes.FallbackWarning != "" {
 			parsed.Warnings = append(parsed.Warnings, callRes.FallbackWarning)
 		}
-		return parsed
+		return finish(parsed)
 	}
 
 	match := jsonBlockRegex.FindString(callRes.Content)
@@ -546,12 +617,14 @@ Return citations as objects with title, url, snippet, provenance. Output must be
 			if callRes.FallbackWarning != "" {
 				parsed.Warnings = append(parsed.Warnings, callRes.FallbackWarning)
 			}
-			return parsed
+			return finish(parsed)
 		}
 	}
 
-	fallbackQA.Answer = callRes.Content
-	return fallbackQA
+	fallbackQA.Answer = "The research model returned an unreadable answer. Please try again."
+	fallbackQA.Degraded = true
+	fallbackQA.Warnings = append(fallbackQA.Warnings, "Model response could not be parsed.")
+	return finish(fallbackQA)
 }
 
 func normalizePayload(data ResearchPayload) ResearchPayload {

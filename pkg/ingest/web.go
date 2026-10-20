@@ -20,7 +20,16 @@ func ExtractWebpage(rawURL string) (string, []db.ChunkItem, []string, string, er
 		return "", nil, nil, "", err
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: &http.Transport{DialContext: DialPublic},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("too many redirects")
+			}
+			return AssertPublicHTTPURL(req.URL.String())
+		},
+	}
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", nil, nil, "", err
@@ -29,7 +38,7 @@ func ExtractWebpage(rawURL string) (string, []db.ChunkItem, []string, string, er
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", nil, nil, "", fmt.Errorf("webpage fetch failed: %w", err)
+		return "", nil, nil, "", errors.New("Could not fetch this webpage. Check the URL and try again")
 	}
 	defer resp.Body.Close()
 

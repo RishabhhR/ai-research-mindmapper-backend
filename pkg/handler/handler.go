@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -68,11 +69,11 @@ func (s *Server) routes() {
 		s.jsonError(w, http.StatusMethodNotAllowed, "Method Not Allowed")
 	})
 
-	// CORS matching Python backend (open for Bearer token requests)
+	// Accept requests from the configured frontend origins.
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins: []string{"*"},
+		AllowedOrigins: s.cfg.FrontendURLs,
 		AllowedHeaders: []string{"Accept", "Authorization", "Content-Type", "X-Filename", "X-Session-Id", "X-Internal-Secret", "*"},
-		AllowedMethods: []string{"GET", "POST", "DELETE", "OPTIONS", "HEAD"},
+		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"},
 	}))
 
 	// Root & Swagger docs
@@ -90,7 +91,9 @@ func (s *Server) routes() {
 		router.Post("/sessions/{session_id}/generate", s.requireAuth(s.handleGenerate))
 		router.Post("/sessions/{session_id}/ask", s.requireAuth(s.handleAsk))
 		router.Get("/sessions", s.requireAuth(s.handleListSessions))
+		router.Delete("/sessions", s.requireAuth(s.handleDeleteAllSessions))
 		router.Get("/sessions/{session_id}", s.requireAuth(s.handleGetSession))
+		router.Put("/sessions/{session_id}/map", s.requireAuth(s.handleSaveMap))
 		router.Delete("/sessions/{session_id}", s.requireAuth(s.handleDeleteSession))
 	}
 
@@ -249,10 +252,38 @@ func (s *Server) jsonError(w http.ResponseWriter, status int, message string) {
 	s.json(w, status, map[string]string{"detail": message})
 }
 
+func (s *Server) storageError(w http.ResponseWriter, err error) {
+	log.Printf("[STORAGE] request failed: %v", err)
+	s.jsonError(w, http.StatusServiceUnavailable, "Research storage is unavailable. Please try again.")
+}
+
+func (s *Server) ownsSession(w http.ResponseWriter, r *http.Request, sessionID, userID string) bool {
+	session, err := s.storage.GetSession(r.Context(), sessionID, userID)
+	if err != nil {
+		s.storageError(w, err)
+		return false
+	}
+	if session == nil {
+		s.jsonError(w, http.StatusNotFound, "Session not found.")
+		return false
+	}
+	return true
+}
+
 // GET /api/health
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	if err := s.storage.Ping(ctx); err != nil {
+		log.Printf("[HEALTH] storage unavailable: %v", err)
+		s.json(w, http.StatusServiceUnavailable, map[string]any{
+			"ok": false, "storage": "unavailable", "youtube_status": s.cfg.YouTubeStatus, "version": s.cfg.AppVersion,
+		})
+		return
+	}
 	s.json(w, http.StatusOK, map[string]any{
 		"ok":             true,
+		"storage":        "ok",
 		"youtube_status": s.cfg.YouTubeStatus,
 		"version":        s.cfg.AppVersion,
 	})
@@ -275,7 +306,7 @@ func (s *Server) handleResearch(w http.ResponseWriter, r *http.Request) {
 			s.jsonError(w, http.StatusTooManyRequests, rlErr.Message)
 			return
 		}
-		s.jsonError(w, http.StatusInternalServerError, err.Error())
+		s.storageError(w, err)
 		return
 	}
 
@@ -294,14 +325,20 @@ func (s *Server) handleResearch(w http.ResponseWriter, r *http.Request) {
 		req.Source = "Academic + web"
 	}
 
+	data := s.llm.GenerateResearch(r.Context(), req.Query, req.Depth, req.Output, req.Source, nil, true)
+	if data.Degraded {
+		s.jsonError(w, http.StatusServiceUnavailable, "Research models are unavailable. Please try again later.")
+		return
+	}
 	sessionID, err := s.storage.CreateSession(r.Context(), req.Query, req.Depth, req.Output, userID)
 	if err != nil {
-		log.Printf("[STORAGE] Warning: failed to create session in DB, generating fallback ID: %v", err)
-		sessionID = db.NewID("ses")
+		s.storageError(w, err)
+		return
 	}
-
-	data := s.llm.GenerateResearch(r.Context(), req.Query, req.Depth, req.Output, req.Source, nil, true)
-	_ = s.storage.SaveGeneration(r.Context(), sessionID, data.Summary, data.Nodes, data.Insights, data.Tradeoffs, data.Citations)
+	if err := s.storage.SaveGeneration(r.Context(), sessionID, data.Summary, data.Nodes, data.Insights, data.Tradeoffs, data.Sources, data.Citations); err != nil {
+		s.storageError(w, err)
+		return
+	}
 
 	data.ID = sessionID
 	data.SessionID = sessionID
@@ -329,7 +366,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 			s.jsonError(w, http.StatusTooManyRequests, rlErr.Message)
 			return
 		}
-		s.jsonError(w, http.StatusInternalServerError, err.Error())
+		s.storageError(w, err)
 		return
 	}
 
@@ -342,9 +379,17 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 			s.jsonError(w, http.StatusBadRequest, "url is required")
 			return
 		}
+		if payload.SessionID != "" && !s.ownsSession(w, r, payload.SessionID, userID) {
+			return
+		}
 
-		// YouTube: async background job
+		// YouTube jobs are processed by polling, so serverless instances never
+		// need to keep a goroutine alive after this response is sent.
 		if ingest.IsYouTubeURL(payload.URL) {
+			if ingest.YouTubeVideoID(payload.URL) == "" {
+				s.jsonError(w, http.StatusBadRequest, "Invalid YouTube video URL")
+				return
+			}
 			sessionID := payload.SessionID
 			if sessionID == "" {
 				topic := payload.Topic
@@ -354,18 +399,16 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 				var err error
 				sessionID, err = s.storage.CreateSession(r.Context(), topic, "Detailed", "Mindmap", userID)
 				if err != nil {
-					s.jsonError(w, http.StatusInternalServerError, err.Error())
+					s.storageError(w, err)
 					return
 				}
 			}
 
 			jobID, err := s.storage.CreateJob(r.Context(), sessionID, userID, "youtube", map[string]string{"url": payload.URL})
 			if err != nil {
-				s.jsonError(w, http.StatusInternalServerError, err.Error())
+				s.storageError(w, err)
 				return
 			}
-
-			s.fireJob(jobID)
 
 			s.json(w, http.StatusOK, map[string]any{
 				"id":           sessionID,
@@ -379,33 +422,34 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// All other URLs: synchronous
-		sessionID := payload.SessionID
-		if sessionID == "" {
-			topic := payload.Topic
-			if topic == "" {
-				topic = payload.URL
-			}
-			var err error
-			sessionID, err = s.storage.CreateSession(r.Context(), topic, "Detailed", "Mindmap", userID)
-			if err != nil {
-				log.Printf("[STORAGE] Warning: failed to create session in DB, generating fallback ID: %v", err)
-				sessionID = db.NewID("ses")
-			}
-		}
-
+		// Extract before creating a session so invalid URLs do not leave empty maps.
 		title, chunks, warnings, sourceType, err := ingest.ExtractWebpage(payload.URL)
 		if err != nil {
 			s.jsonError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-
-		sourceID, err := s.storage.AddSource(r.Context(), sessionID, sourceType, title, payload.URL, "")
-		if err != nil {
-			log.Printf("[STORAGE] Warning: failed to add source to DB: %v", err)
-			sourceID = db.NewID("src")
+		if len(chunks) == 0 {
+			s.jsonError(w, http.StatusUnprocessableEntity, "No readable text was found at this URL.")
+			return
 		}
-		_ = s.storage.AddChunks(r.Context(), sessionID, sourceID, sourceType, title, chunks, payload.URL)
+		sessionID := payload.SessionID
+		if sessionID == "" {
+			topic := payload.Topic
+			if topic == "" {
+				topic = title
+			}
+			sessionID, err = s.storage.CreateSession(r.Context(), topic, "Detailed", "Mindmap", userID)
+			if err != nil {
+				s.storageError(w, err)
+				return
+			}
+		}
+
+		sourceID, err := s.storage.AddSourceWithChunks(r.Context(), sessionID, sourceType, title, payload.URL, chunks)
+		if err != nil {
+			s.storageError(w, err)
+			return
+		}
 
 		s.json(w, http.StatusOK, map[string]any{
 			"id":           sessionID,
@@ -424,6 +468,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 	var bodyBytes []byte
 
 	if strings.Contains(contentType, "multipart/form-data") {
+		r.Body = http.MaxBytesReader(w, r.Body, ingest.MaxFileBytes+1024*1024)
 		err := r.ParseMultipartForm(10 * 1024 * 1024)
 		if err != nil {
 			s.jsonError(w, http.StatusBadRequest, "failed to parse multipart: "+err.Error())
@@ -436,22 +481,30 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		}
 		defer file.Close()
 		filename = fileHeader.Filename
-		bodyBytes, _ = io.ReadAll(file)
+		bodyBytes, err = io.ReadAll(io.LimitReader(file, ingest.MaxFileBytes+1))
+		if err != nil {
+			s.jsonError(w, http.StatusBadRequest, "Could not read uploaded file.")
+			return
+		}
 	} else {
 		if filename == "" {
 			filename = "upload.txt"
 		}
-		bodyBytes, _ = io.ReadAll(r.Body)
+		var err error
+		bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, ingest.MaxFileBytes+1))
+		if err != nil {
+			s.jsonError(w, http.StatusBadRequest, "Could not read uploaded file.")
+			return
+		}
+	}
+	if len(bodyBytes) > ingest.MaxFileBytes {
+		s.jsonError(w, http.StatusRequestEntityTooLarge, "File is too large. Keep uploads under 8 MB.")
+		return
 	}
 
 	sessionID := r.Header.Get("X-Session-Id")
-	if sessionID == "" {
-		var err error
-		sessionID, err = s.storage.CreateSession(r.Context(), filename, "Detailed", "Mindmap", userID)
-		if err != nil {
-			log.Printf("[STORAGE] Warning: failed to create session in DB, generating fallback ID: %v", err)
-			sessionID = db.NewID("ses")
-		}
+	if sessionID != "" && !s.ownsSession(w, r, sessionID, userID) {
+		return
 	}
 
 	title, chunks, warnings, sourceType, err := ingest.ExtractFile(filename, bodyBytes)
@@ -459,13 +512,23 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		s.jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	sourceID, err := s.storage.AddSource(r.Context(), sessionID, sourceType, title, "", "")
-	if err != nil {
-		log.Printf("[STORAGE] Warning: failed to add source to DB: %v", err)
-		sourceID = db.NewID("src")
+	if len(chunks) == 0 {
+		s.jsonError(w, http.StatusUnprocessableEntity, "No readable text was found in this file.")
+		return
 	}
-	_ = s.storage.AddChunks(r.Context(), sessionID, sourceID, sourceType, title, chunks, "")
+	if sessionID == "" {
+		sessionID, err = s.storage.CreateSession(r.Context(), filename, "Detailed", "Mindmap", userID)
+		if err != nil {
+			s.storageError(w, err)
+			return
+		}
+	}
+
+	sourceID, err := s.storage.AddSourceWithChunks(r.Context(), sessionID, sourceType, title, "", chunks)
+	if err != nil {
+		s.storageError(w, err)
+		return
+	}
 
 	s.json(w, http.StatusOK, map[string]any{
 		"id":           sessionID,
@@ -478,32 +541,31 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) fireJob(jobID string) {
-	if s.cfg.InternalSecret == "" {
-		log.Printf("INTERNAL_SECRET not set — running job %s inline in background goroutine", jobID)
-		go s.processJob(jobID)
-		return
+func (s *Server) processJob(requestCtx context.Context, jobID string) error {
+	ctx, cancel := context.WithTimeout(requestCtx, 47*time.Second)
+	defer cancel()
+	claimed, err := s.storage.ClaimJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		return nil
 	}
 
-	// Trigger worker endpoint asynchronously
-	go func() {
-		client := &http.Client{Timeout: 3 * time.Second}
-		req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/internal/jobs/%s/run", s.cfg.BackendURL, jobID), nil)
-		if err == nil {
-			req.Header.Set("X-Internal-Secret", s.cfg.InternalSecret)
-			_, _ = client.Do(req)
-		}
-	}()
-}
-
-func (s *Server) processJob(jobID string) {
-	ctx := context.Background()
 	job, err := s.storage.GetJob(ctx, jobID, "")
-	if err != nil || job == nil || job["status"] != "pending" {
-		return
+	if err != nil {
+		return err
 	}
-
-	_ = s.storage.UpdateJob(ctx, jobID, "processing", nil, "")
+	if job == nil {
+		return nil
+	}
+	fail := func(message string) {
+		updateCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
+		defer done()
+		if err := s.storage.UpdateJob(updateCtx, jobID, "failed", nil, message); err != nil {
+			log.Printf("[STORAGE] failed to update job %s: %v", jobID, err)
+		}
+	}
 
 	jobType, _ := job["type"].(string)
 	sessionID, _ := job["session_id"].(string)
@@ -512,15 +574,24 @@ func (s *Server) processJob(jobID string) {
 		inputMap, _ := job["input"].(map[string]any)
 		rawURL, _ := inputMap["url"].(string)
 
-		title, chunks, warnings, sourceType, err := ingest.ExtractYouTube(s.cfg, rawURL)
+		title, chunks, warnings, sourceType, err := ingest.ExtractYouTube(ctx, s.cfg, rawURL)
 		if err != nil {
-			_ = s.storage.UpdateJob(ctx, jobID, "failed", nil, err.Error())
-			return
+			fail(err.Error())
+			return nil
+		}
+		if len(chunks) == 0 {
+			message := "Could not extract a transcript from this video."
+			if len(warnings) > 0 {
+				message = warnings[0]
+			}
+			fail(message)
+			return nil
 		}
 
-		sourceID, _ := s.storage.AddSource(ctx, sessionID, sourceType, title, rawURL, "")
-		if len(chunks) > 0 {
-			_ = s.storage.AddChunks(ctx, sessionID, sourceID, sourceType, title, chunks, rawURL)
+		sourceID, err := s.storage.AddSourceWithChunks(ctx, sessionID, sourceType, title, rawURL, chunks)
+		if err != nil {
+			fail("Could not save the transcript. Please try again.")
+			return err
 		}
 
 		result := map[string]any{
@@ -531,10 +602,13 @@ func (s *Server) processJob(jobID string) {
 			"chunks_count": len(chunks),
 			"warnings":     warnings,
 		}
-		_ = s.storage.UpdateJob(ctx, jobID, "done", result, "")
+		if err := s.storage.UpdateJob(ctx, jobID, "done", result, ""); err != nil {
+			return err
+		}
 	} else {
-		_ = s.storage.UpdateJob(ctx, jobID, "failed", nil, fmt.Sprintf("Unknown job type: %s", jobType))
+		fail("Unknown job type")
 	}
+	return nil
 }
 
 // POST /api/internal/jobs/{job_id}/run
@@ -547,7 +621,10 @@ func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.processJob(jobID)
+	if err := s.processJob(r.Context(), jobID); err != nil {
+		s.storageError(w, err)
+		return
+	}
 	job, _ := s.storage.GetJob(r.Context(), jobID, "")
 	status := "unknown"
 	if job != nil {
@@ -568,6 +645,21 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	if err != nil || job == nil {
 		s.jsonError(w, http.StatusNotFound, "Job not found")
 		return
+	}
+	if job["status"] == "pending" || job["status"] == "processing" {
+		if err := s.processJob(r.Context(), jobID); err != nil {
+			s.storageError(w, err)
+			return
+		}
+		job, err = s.storage.GetJob(r.Context(), jobID, userID)
+		if err != nil {
+			s.storageError(w, err)
+			return
+		}
+		if job == nil {
+			s.jsonError(w, http.StatusNotFound, "Job not found")
+			return
+		}
 	}
 
 	out := map[string]any{
@@ -595,10 +687,11 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/sessions/{session_id}/generate
 type GenerateRequest struct {
-	Topic  string `json:"topic"`
-	Depth  string `json:"depth"`
-	Output string `json:"output"`
-	Source string `json:"source"`
+	Topic   string `json:"topic"`
+	Depth   string `json:"depth"`
+	Output  string `json:"output"`
+	Source  string `json:"source"`
+	Persist *bool  `json:"persist,omitempty"`
 }
 
 func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
@@ -612,12 +705,16 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 			s.jsonError(w, http.StatusTooManyRequests, rlErr.Message)
 			return
 		}
-		s.jsonError(w, http.StatusInternalServerError, err.Error())
+		s.storageError(w, err)
 		return
 	}
 
 	session, err := s.storage.GetSession(r.Context(), sessionID, userID)
-	if err != nil || session == nil {
+	if err != nil {
+		s.storageError(w, err)
+		return
+	}
+	if session == nil {
 		s.jsonError(w, http.StatusNotFound, "Session not found.")
 		return
 	}
@@ -640,16 +737,36 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		topic, _ = session["topic"].(string)
 	}
 
-	rawChunks, _ := s.storage.GetChunks(r.Context(), sessionID, 80)
+	rawChunks, err := s.storage.GetChunks(r.Context(), sessionID, 80)
+	if err != nil {
+		s.storageError(w, err)
+		return
+	}
 	var chunkItems []db.ChunkItem
 	for _, c := range rawChunks {
 		txt, _ := c["text"].(string)
-		chunkItems = append(chunkItems, db.ChunkItem{Text: txt})
+		title, _ := c["title"].(string)
+		url, _ := c["url"].(string)
+		var page *int
+		if raw, ok := c["page"].(int64); ok {
+			number := int(raw)
+			page = &number
+		}
+		chunkItems = append(chunkItems, db.ChunkItem{Text: txt, Title: title, URL: url, Page: page})
 	}
 
 	useWeb := len(chunkItems) == 0
 	data := s.llm.GenerateResearch(r.Context(), topic, req.Depth, req.Output, req.Source, chunkItems, useWeb)
-	_ = s.storage.SaveGeneration(r.Context(), sessionID, data.Summary, data.Nodes, data.Insights, data.Tradeoffs, data.Citations)
+	if data.Degraded && len(chunkItems) == 0 {
+		s.jsonError(w, http.StatusServiceUnavailable, "Research models are unavailable. Please try again later.")
+		return
+	}
+	if req.Persist == nil || *req.Persist {
+		if err := s.storage.SaveGeneration(r.Context(), sessionID, data.Summary, data.Nodes, data.Insights, data.Tradeoffs, data.Sources, data.Citations); err != nil {
+			s.storageError(w, err)
+			return
+		}
+	}
 
 	data.ID = sessionID
 	data.SessionID = sessionID
@@ -677,12 +794,16 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 			s.jsonError(w, http.StatusTooManyRequests, rlErr.Message)
 			return
 		}
-		s.jsonError(w, http.StatusInternalServerError, err.Error())
+		s.storageError(w, err)
 		return
 	}
 
 	session, err := s.storage.GetSession(r.Context(), sessionID, userID)
-	if err != nil || session == nil {
+	if err != nil {
+		s.storageError(w, err)
+		return
+	}
+	if session == nil {
 		s.jsonError(w, http.StatusNotFound, "Session not found.")
 		return
 	}
@@ -693,23 +814,43 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rawChunks, _ := s.storage.GetChunks(r.Context(), sessionID, 80)
+	rawChunks, err := s.storage.GetRelevantChunks(r.Context(), sessionID, req.Question, 80)
+	if err != nil {
+		s.storageError(w, err)
+		return
+	}
 	var chunkItems []db.ChunkItem
 	for _, c := range rawChunks {
 		txt, _ := c["text"].(string)
-		chunkItems = append(chunkItems, db.ChunkItem{Text: txt})
+		title, _ := c["title"].(string)
+		url, _ := c["url"].(string)
+		var page *int
+		if raw, ok := c["page"].(int64); ok {
+			number := int(raw)
+			page = &number
+		}
+		chunkItems = append(chunkItems, db.ChunkItem{Text: txt, Title: title, URL: url, Page: page})
 	}
 
 	ranked := rankChunks(chunkItems, req.Question)
 	useWeb := len(ranked) < 2
 	data := s.llm.AnswerQuestion(r.Context(), req.Question, ranked, useWeb)
+	if data.Degraded && len(ranked) == 0 {
+		s.jsonError(w, http.StatusServiceUnavailable, "Research models are unavailable. Please try again later.")
+		return
+	}
 
-	_ = s.storage.AddQA(r.Context(), sessionID, req.Question, data.Answer, data.Citations, data.Provenance)
+	if err := s.storage.AddQA(r.Context(), sessionID, req.Question, data.Answer, data.Citations, data.Provenance); err != nil {
+		s.storageError(w, err)
+		return
+	}
 	s.json(w, http.StatusOK, data)
 }
 
 func rankChunks(chunks []db.ChunkItem, question string) []db.ChunkItem {
-	words := strings.Fields(strings.ToLower(question))
+	words := strings.FieldsFunc(strings.ToLower(question), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
 	terms := make(map[string]bool)
 	for _, w := range words {
 		if len(w) > 3 {
@@ -763,8 +904,8 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	userID := getUserID(r)
 	list, err := s.storage.ListSessions(r.Context(), userID)
 	if err != nil {
-		log.Printf("[STORAGE] Warning: ListSessions error: %v", err)
-		list = []map[string]any{}
+		s.storageError(w, err)
+		return
 	}
 	if list == nil {
 		list = []map[string]any{}
@@ -778,15 +919,31 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	userID := getUserID(r)
 
 	session, err := s.storage.GetSession(r.Context(), sessionID, userID)
-	if err != nil || session == nil {
+	if err != nil {
+		s.storageError(w, err)
+		return
+	}
+	if session == nil {
 		s.jsonError(w, http.StatusNotFound, "Session not found.")
 		return
 	}
 
 	decodedSession := decodeSession(session)
-	sources, _ := s.storage.GetSources(r.Context(), sessionID)
-	chunks, _ := s.storage.GetChunks(r.Context(), sessionID, 20)
-	rawQA, _ := s.storage.GetQA(r.Context(), sessionID)
+	sources, err := s.storage.GetSources(r.Context(), sessionID)
+	if err != nil {
+		s.storageError(w, err)
+		return
+	}
+	chunks, err := s.storage.GetChunks(r.Context(), sessionID, 20)
+	if err != nil {
+		s.storageError(w, err)
+		return
+	}
+	rawQA, err := s.storage.GetQA(r.Context(), sessionID)
+	if err != nil {
+		s.storageError(w, err)
+		return
+	}
 
 	qaHistory := make([]map[string]any, len(rawQA))
 	for i, q := range rawQA {
@@ -806,7 +963,7 @@ func decodeSession(row map[string]any) map[string]any {
 	for k, v := range row {
 		out[k] = v
 	}
-	for _, key := range []string{"mindmap_json", "insights_json", "tradeoffs_json", "citations_json"} {
+	for _, key := range []string{"mindmap_json", "insights_json", "tradeoffs_json", "sources_json", "citations_json"} {
 		if valStr, ok := out[key].(string); ok && valStr != "" {
 			var decoded any
 			if json.Unmarshal([]byte(valStr), &decoded) == nil {
@@ -837,16 +994,65 @@ func decodeQA(row map[string]any) map[string]any {
 	return out
 }
 
+type SaveMapRequest struct {
+	Nodes    []llm.Node    `json:"nodes"`
+	Insights []llm.Insight `json:"insights"`
+	Sources  []llm.Source  `json:"sources"`
+	RootX    float64       `json:"root_x"`
+	RootY    float64       `json:"root_y"`
+}
+
+func (s *Server) handleSaveMap(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "session_id")
+	userID := getUserID(r)
+	if !s.ownsSession(w, r, sessionID, userID) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 512*1024)
+	var req SaveMapRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.jsonError(w, http.StatusBadRequest, "Invalid map data.")
+		return
+	}
+	if len(req.Nodes) > 200 || len(req.Insights) > 200 || len(req.Sources) > 200 || req.RootX < 0 || req.RootX > 95 || req.RootY < 0 || req.RootY > 95 {
+		s.jsonError(w, http.StatusBadRequest, "Map data exceeds allowed limits.")
+		return
+	}
+	saved, err := s.storage.SaveMap(r.Context(), sessionID, userID, req.Nodes, req.Insights, req.Sources, req.RootX, req.RootY)
+	if err != nil {
+		s.storageError(w, err)
+		return
+	}
+	if !saved {
+		s.jsonError(w, http.StatusNotFound, "Session not found.")
+		return
+	}
+	s.json(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // DELETE /api/sessions/{session_id}
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "session_id")
 	userID := getUserID(r)
 
 	deleted, err := s.storage.DeleteSession(r.Context(), sessionID, userID)
-	if err != nil || !deleted {
+	if err != nil {
+		s.storageError(w, err)
+		return
+	}
+	if !deleted {
 		s.jsonError(w, http.StatusNotFound, "Session not found.")
 		return
 	}
 
 	s.json(w, http.StatusOK, map[string]any{"ok": true, "deleted": sessionID})
+}
+
+func (s *Server) handleDeleteAllSessions(w http.ResponseWriter, r *http.Request) {
+	deleted, err := s.storage.DeleteAllSessions(r.Context(), getUserID(r))
+	if err != nil {
+		s.storageError(w, err)
+		return
+	}
+	s.json(w, http.StatusOK, map[string]any{"ok": true, "deleted_count": deleted})
 }

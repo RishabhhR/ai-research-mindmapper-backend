@@ -6,6 +6,7 @@ type Node struct {
 	X           float64 `json:"x"`
 	Y           float64 `json:"y"`
 	Provenance  string  `json:"provenance"`
+	ParentID    string  `json:"parent_id,omitempty"`
 }
 
 type Insight struct {
@@ -33,10 +34,12 @@ type Citation struct {
 	Title      string `json:"title"`
 	URL        string `json:"url"`
 	Snippet    string `json:"snippet"`
+	Page       *int   `json:"page,omitempty"`
 	Provenance string `json:"provenance"`
 }
 
 type ResearchPayload struct {
+	Degraded   bool       `json:"-"`
 	ID         string     `json:"id,omitempty"`
 	SessionID  string     `json:"session_id,omitempty"`
 	Topic      string     `json:"topic,omitempty"`
@@ -54,6 +57,7 @@ type ResearchPayload struct {
 }
 
 type QAPayload struct {
+	Degraded           bool       `json:"-"`
 	Answer             string     `json:"answer"`
 	Provenance         string     `json:"provenance"`
 	Citations          []Citation `json:"citations"`

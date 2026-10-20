@@ -9,22 +9,26 @@ import (
 	"github.com/joho/godotenv"
 
 	"ai-research-mindmapper-go/pkg/config"
+	"ai-research-mindmapper-go/pkg/db"
 )
 
 func TestParseJSONOrFallback(t *testing.T) {
 	fallback := ResearchPayload{Summary: "fallback summary"}
 
 	// Clean JSON
-	parsed, ok := parseJSONOrFallback(`{"summary": "hi"}`, fallback)
+	parsed, ok := parseJSONOrFallback(`{"summary": "hi", "nodes": [{"title": "n"}]}`, fallback)
 	if !ok || parsed.Summary != "hi" {
 		t.Fatalf("expected 'hi', got %q", parsed.Summary)
 	}
 
 	// Wrapped in prose
-	wrapped := "Sure! Here is the JSON:\n{\"summary\": \"extracted\"}\nHope that helps."
+	wrapped := "Sure! Here is the JSON:\n{\"summary\": \"extracted\", \"nodes\": [{\"title\": \"n\"}]}\nHope that helps."
 	parsed, ok = parseJSONOrFallback(wrapped, fallback)
 	if !ok || parsed.Summary != "extracted" {
 		t.Fatalf("expected 'extracted', got %q", parsed.Summary)
+	}
+	if _, ok := parseJSONOrFallback(`{"summary":"missing map"}`, fallback); ok {
+		t.Fatal("a response with no map nodes must fall back")
 	}
 
 	// Empty content
@@ -67,22 +71,32 @@ func TestNormalizePayload(t *testing.T) {
 }
 
 func TestOfflineGeneration(t *testing.T) {
-	res := OfflineGeneration("Quantum Computing", nil, "ai_synthesized")
-	if res.Summary == "" {
-		t.Fatal("expected summary in offline generation")
+	noEvidence := OfflineGeneration("Quantum Computing", nil, "ai_synthesized")
+	if !noEvidence.Degraded || len(noEvidence.Nodes) != 0 {
+		t.Fatal("provider failure without evidence must not return a fabricated map")
 	}
-	if len(res.Nodes) == 0 {
-		t.Fatal("expected nodes in offline generation")
+	evidence := []db.ChunkItem{{Title: "Paper", URL: "https://example.com/paper", Text: "A verified excerpt about the topic."}}
+	res := OfflineGeneration("Quantum Computing", evidence, "source_grounded")
+	if !res.Degraded || len(res.Nodes) != 1 || res.Nodes[0].Description != evidence[0].Text {
+		t.Fatalf("expected an extractive fallback, got %+v", res)
 	}
-	if len(res.Insights) == 0 {
-		t.Fatal("expected insights in offline generation")
+	if len(res.Citations) != 1 || res.Citations[0].URL != evidence[0].URL {
+		t.Fatal("fallback citation must point to the supplied source")
 	}
-	if len(res.Tradeoffs) == 0 {
-		t.Fatal("expected tradeoffs in offline generation")
+}
+
+func TestAnswerQuestionWithoutProviderDoesNotClaimUngroundedSuccess(t *testing.T) {
+	client := NewClient(&config.Config{})
+	answer := client.AnswerQuestion(context.Background(), "What is the answer?", nil, false)
+	if !answer.Degraded || answer.EvidenceSufficient || len(answer.Citations) != 0 {
+		t.Fatalf("expected unavailable ungrounded answer, got %+v", answer)
 	}
 }
 
 func TestLiveGroq(t *testing.T) {
+	if os.Getenv("RUN_LIVE_TESTS") != "1" {
+		t.Skip("set RUN_LIVE_TESTS=1 to call Groq")
+	}
 	_ = godotenv.Load("../../.env")
 	groqKey := os.Getenv("GROQ_API_KEY")
 	if groqKey == "" {
@@ -96,17 +110,24 @@ func TestLiveGroq(t *testing.T) {
 	}
 	client := NewClient(cfg)
 	ctx := context.Background()
+	direct := client.callGroq(ctx, buildMindmapPrompt("Quantum Computing", "Basic", "Mindmap", "Academic + web", "", true), 8)
+	if direct.Offline {
+		t.Fatalf("Groq unavailable: %s", direct.Warning)
+	}
 	payload := client.GenerateResearch(ctx, "Quantum Computing", "Basic", "Mindmap", "Academic + web", nil, true)
 	if payload.Summary == "" {
 		t.Fatal("empty summary from Groq generation")
 	}
 	if len(payload.Nodes) == 0 {
-		t.Fatal("empty nodes from Groq generation")
+		t.Fatalf("empty nodes from Groq generation; warnings=%v summary=%q", payload.Warnings, payload.Summary)
 	}
 	t.Logf("Generated %d nodes, provenance: %s", len(payload.Nodes), payload.Provenance)
 }
 
 func TestLiveGemini(t *testing.T) {
+	if os.Getenv("RUN_LIVE_TESTS") != "1" {
+		t.Skip("set RUN_LIVE_TESTS=1 to call Gemini")
+	}
 	_ = godotenv.Load("../../.env")
 	geminiKey := os.Getenv("GEMINI_API_KEY")
 	if geminiKey == "" {
@@ -141,6 +162,9 @@ func TestLiveGemini(t *testing.T) {
 }
 
 func TestLiveFallbackToGemini(t *testing.T) {
+	if os.Getenv("RUN_LIVE_TESTS") != "1" {
+		t.Skip("set RUN_LIVE_TESTS=1 to call Gemini")
+	}
 	_ = godotenv.Load("../../.env")
 	geminiKey := os.Getenv("GEMINI_API_KEY")
 	if geminiKey == "" {
@@ -163,6 +187,3 @@ func TestLiveFallbackToGemini(t *testing.T) {
 	}
 	t.Logf("Fallback successful: %d nodes, summary: %s, warnings: %v", len(payload.Nodes), payload.Summary, payload.Warnings)
 }
-
-
-

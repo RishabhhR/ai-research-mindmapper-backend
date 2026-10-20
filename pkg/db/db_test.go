@@ -42,6 +42,9 @@ func TestProtoValueConversion(t *testing.T) {
 }
 
 func TestLiveTursoConnection(t *testing.T) {
+	if os.Getenv("RUN_LIVE_TESTS") != "1" {
+		t.Skip("set RUN_LIVE_TESTS=1 to call Turso")
+	}
 	_ = godotenv.Load("../../.env")
 	tursoURL := os.Getenv("TURSO_URL")
 	tursoToken := os.Getenv("TURSO_AUTH_TOKEN")
@@ -71,6 +74,9 @@ func TestLiveTursoConnection(t *testing.T) {
 }
 
 func TestLiveStorageOperations(t *testing.T) {
+	if os.Getenv("RUN_LIVE_TESTS") != "1" {
+		t.Skip("set RUN_LIVE_TESTS=1 to write to Turso")
+	}
 	_ = godotenv.Load("../../.env")
 	tursoURL := os.Getenv("TURSO_URL")
 	tursoToken := os.Getenv("TURSO_AUTH_TOKEN")
@@ -98,7 +104,16 @@ func TestLiveStorageOperations(t *testing.T) {
 	}
 
 	// Clean up
-	_, _ = storage.DeleteSession(ctx, sessionID, "test_user_123")
+	defer storage.DeleteSession(ctx, sessionID, "test_user_123")
+	_, err = storage.AddSourceWithChunks(ctx, sessionID, "txt", "A test document", "", []ChunkItem{
+		{Text: "The opening explains a general overview."},
+		{Text: "The later section explains a quantum algorithm."},
+	})
+	if err != nil {
+		t.Fatalf("AddSourceWithChunks failed: %v", err)
+	}
+	relevant, err := storage.GetRelevantChunks(ctx, sessionID, "What does the quantum algorithm do?", 10)
+	if err != nil || len(relevant) == 0 || relevant[0]["text"] != "The later section explains a quantum algorithm." {
+		t.Fatalf("relevant chunk retrieval failed: chunks=%v err=%v", relevant, err)
+	}
 }
-
-

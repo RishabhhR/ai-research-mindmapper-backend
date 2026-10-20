@@ -1,5 +1,5 @@
 # ── Stage 1: Build the Go binary ──────────────────────────────────────────────
-FROM golang:1.24-alpine AS builder
+FROM golang:1.27.2-alpine3.24 AS builder
 
 WORKDIR /app
 
@@ -17,12 +17,12 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/server cmd/server/main.go
 
 # ── Stage 2: Minimal runtime image ──────────────────────────────────────────
-FROM alpine:3.20
+FROM alpine:3.24
 
 WORKDIR /app
 
 # Install ca-certificates and curl for healthcheck
-RUN apk add --no-cache ca-certificates tzdata curl
+RUN apk add --no-cache ca-certificates tzdata curl yt-dlp
 
 # Copy binary from builder
 COPY --from=builder /app/server /app/server
